@@ -1,0 +1,10 @@
+# Fonts are downloaded on first launch - their licences don't allow redistributing them
+assets/fonts/
+
+# Python / build output
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+.venv*/
