@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 # Settings. Twitch changes the GQL hashes from time to time; if requests start
 # failing with "PersistedQueryNotFound", update them in settings.json.
 # --------------------------------------------------------------------------
+APP_VERSION = "1.0.1"
+
 DEFAULTS = {
     "client_id": "ue6666qo983tsx6so1t0vnawi233wa",  # Twitch Android TV app (supports device login)
     "user_agent": (
@@ -42,6 +44,7 @@ DEFAULTS = {
     "mining_disabled": [],       # account logins unticked in the Accounts table (all others mine)
     "prefer_streamer_drops": True,  # within a game, streamer-specific drops before general ones
     "mine_unselected": False,    # mine other campaigns when the picked games have nothing
+    "mine_unselected_confirmed": False,  # set when the user OKs the "mine games I haven't picked" prompt
     "refresh_minutes": 10,       # how often to rescan Twitch for campaigns
     "scan_categories": 300,      # how many of Twitch's top categories to check for drops
     "auto_mine_on_launch": True, # start mining as soon as the app opens (if logged in)
@@ -103,6 +106,10 @@ def load_settings():
             settings["hashes"].update(value)
         elif key in settings:
             settings[key] = value
+    if settings["mine_unselected"] and not settings["mine_unselected_confirmed"]:
+        # Before v1.0.1 this was a single unconfirmed checkbox that was easy to tick by accident,
+        # which made the miner wander off to games nobody picked. Keep it only once confirmed.
+        settings["mine_unselected"] = False
     return settings
 
 

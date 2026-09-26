@@ -299,6 +299,7 @@ class Discovery:
         self.emit("status", "Scanning Twitch for drop campaigns...")
         started = time.time()
         cats = client.get_top_categories(int(self.settings.get("scan_categories", 300)))
+        self._resolve_picked_games(cats, client)
         known = {c["slug"] for c in cats}
         deep = self.deep_slugs()
         for slug in deep - known:  # always include picked games, even small ones
@@ -341,6 +342,35 @@ class Discovery:
         games = len({c.slug for c in found.values()})
         self.emit("log", f"Found {len(found)} campaign(s) across {games} game(s) "
                          f"in {time.time() - started:.0f}s")
+
+    def _resolve_picked_games(self, cats, client):
+        """Point each picked game at Twitch's real category. A game's page address doesn't always
+        match its name (e.g. "Overwatch" lives at overwatch-2), and names typed in older versions
+        only had a guessed address - so that game was never recognised as picked."""
+        mapping = self.settings.setdefault("game_slugs", {})
+        by_name = {c["name"].lower(): c["slug"] for c in cats if c.get("name")}
+        valid = {c["slug"] for c in cats}
+        changed = False
+        for game in list(self.settings["priority_games"]):
+            current = mapping.get(game) or slugify(game)
+            if current in valid:
+                continue
+            real = by_name.get(game.lower())
+            if real:
+                mapping[game] = real
+                changed = True
+                self.emit("log", f"Matched your picked game '{game}' to Twitch's category ({real})")
+                continue
+            try:
+                game_info, _ = client.get_game_streams(current, limit=1)
+            except TwitchError:
+                continue
+            if game_info is None and game not in self._page_warned:
+                self._page_warned.add(game)
+                self.emit("log", f"WARNING: couldn't find '{game}' on Twitch - remove it from the Games list and "
+                                 "tick \"Mine game\" on one of its campaigns instead")
+        if changed:
+            save_json(SETTINGS_FILE, self.settings)
 
     def scan_game(self, client, slug, channels_to_check):
         """Campaigns running on a game's live drops-enabled channels."""
@@ -755,6 +785,7 @@ class Miner:
         self.blocked = False
         self.blocked_warned = False
         self.cooldown = {}  # campaign id -> time before which it isn't retried
+        self._fallback_noted = None  # last unpicked campaign we explained in the log
 
     def emit(self, kind, *payload):
         # After Stop, a tick that was mid-request must not repaint the UI.
@@ -915,6 +946,11 @@ class Miner:
             what = f"{drop.rewards} ({camp.name})" if drop else f"'{camp.name}'"
             if not self.channel or self.channel["login"] != channel["login"]:
                 self.log(f"Watching {channel['display']} ({channel['game_name']}) for {what}")
+            picked = drop is not None or camp.slug in self.store.selected_slugs()
+            if not picked and self._fallback_noted != camp.id:
+                self._fallback_noted = camp.id
+                self.log(f"{camp.game_name} isn't one of your picked games - mining it because \"Also mine "
+                         "games I haven't picked\" is on (Settings). Untick it to only mine your games.")
             self.channel = channel
             self.store.target_id, self.store.target_drop_id = camp.id, (drop.id if drop else None)
             self.store.publish()

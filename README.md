@@ -58,6 +58,7 @@ Make sure each game's account is linked on
 |---|---|
 | A red banner says watch time isn't reaching Twitch | Your DNS blocks `spade.twitch.tv`, which is where Twitch counts watch time. In Mullvad, turn off **both** the *Ads* and *Trackers* DNS content blockers; Pi-hole / AdGuard need it allow-listed. |
 | A campaign shows *Not progressing* | No progress for 8 minutes, usually because the game account isn't linked. Link it, then click **Refresh campaigns**. |
+| It's mining games I didn't pick | That's the **Also mine games I haven't picked** option (Settings → Mining). Untick it and the miner only mines your queue and picked games, and waits when they have nothing left. |
 | A streamer drop shows *Not started* | The streamer is live, but Twitch hasn't switched their drop on yet. It's retried on every rescan. |
 | Where are my settings? | `%APPDATA%\TwitchDropClaimer\` (settings, saved logins, downloaded fonts). |
 

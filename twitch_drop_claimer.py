@@ -24,7 +24,7 @@ from datetime import datetime
 from tkinter import ttk, messagebox
 
 from twitch_api import (
-    AccountStore, CLIENT_URL, DROPS_PAGE_URL, SETTINGS_FILE, TwitchClient, TwitchError,
+    APP_VERSION, AccountStore, CLIENT_URL, DROPS_PAGE_URL, SETTINGS_FILE, TwitchClient, TwitchError,
     game_slug, load_settings, save_json,
 )
 from miner import CampaignStore, Discovery, Miner, fmt_minutes
@@ -567,8 +567,8 @@ class App(tk.Tk):
                                    "channels too)", variable=self.prefer_var,
                         command=self.on_setting_changed).pack(anchor="w", pady=(10, 0))
         self.unselected_var = tk.BooleanVar(value=bool(self.settings.get("mine_unselected")))
-        ttk.Checkbutton(gtab, text="When these have nothing to mine,\nmine any other available campaign",
-                        variable=self.unselected_var, command=self.on_setting_changed).pack(anchor="w", pady=(6, 0))
+        ttk.Checkbutton(gtab, text="Also mine games I haven't picked\n(only when these and the queue have nothing left)",
+                        variable=self.unselected_var, command=self.on_toggle_unselected).pack(anchor="w", pady=(6, 0))
         self._refresh_prio_list()
         return pg
 
@@ -603,9 +603,9 @@ class App(tk.Tk):
         ttk.Checkbutton(mine, text="Within a game, mine streamer-specific drops before general drops "
                                    "(general drops progress on streamer channels too)",
                         variable=self.prefer_var, command=self.on_setting_changed).pack(anchor="w", pady=2)
-        ttk.Checkbutton(mine, text="When the drop queue and picked games have nothing to mine, "
-                                   "mine any other available campaign",
-                        variable=self.unselected_var, command=self.on_setting_changed).pack(anchor="w", pady=2)
+        ttk.Checkbutton(mine, text="Also mine games I haven't picked (only when the drop queue and picked games "
+                                   "have nothing left). Off = the miner waits instead.",
+                        variable=self.unselected_var, command=self.on_toggle_unselected).pack(anchor="w", pady=2)
         row = ttk.Frame(mine)
         row.pack(anchor="w", pady=6)
         ttk.Label(row, text="Rescan Twitch for new campaigns every").pack(side="left")
@@ -640,6 +640,7 @@ class App(tk.Tk):
         link.pack(anchor="w", pady=(6, 0))
         link.bind("<Button-1>", lambda e: webbrowser.open(DROPS_PAGE_URL))
         ttk.Label(help_, text=f"Settings file: {SETTINGS_FILE}", style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
+        ttk.Label(help_, text=f"Doki Twitch Miner v{APP_VERSION}", style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
         return pg
 
     # -- Pages ------------------------------------------------------------------
@@ -1659,6 +1660,21 @@ class App(tk.Tk):
         except OSError as e:
             self.startup_var.set(not want)
             messagebox.showerror("Startup setting", f"Could not change the startup setting:\n{e}")
+
+    def on_toggle_unselected(self):
+        """Turning on "mine games I haven't picked" needs a yes - it's easy to tick by accident."""
+        on = bool(self.unselected_var.get())
+        if on and not messagebox.askyesno(
+                "Mine games you haven't picked?",
+                "When your drop queue and picked games have nothing left to mine, the miner will watch "
+                "campaigns for ANY other game on Twitch (for example Marvel Rivals or World of Warcraft).\n\n"
+                "Leave this off to only mine the games you picked - the miner then waits for them "
+                "instead.\n\nTurn it on?"):
+            self.unselected_var.set(False)
+            on = False
+        self.settings["mine_unselected_confirmed"] = on
+        self.log("Will also mine games you haven't picked" if on else "Only mining your picked games and queue")
+        self.on_setting_changed()
 
     def on_setting_changed(self):
         self.settings["start_minimized"] = bool(self.minimized_var.get())
