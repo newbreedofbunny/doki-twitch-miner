@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 # Settings. Twitch changes the GQL hashes from time to time; if requests start
 # failing with "PersistedQueryNotFound", update them in settings.json.
 # --------------------------------------------------------------------------
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 DEFAULTS = {
     "client_id": "ue6666qo983tsx6so1t0vnawi233wa",  # Twitch Android TV app (supports device login)

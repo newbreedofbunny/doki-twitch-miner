@@ -309,6 +309,13 @@ class Sidebar(tk.Canvas):
         self.claimed = 0
         self.login = ""
         self.bind("<Configure>", lambda e: self.redraw())
+        # Bound once: tag bindings outlive the items, and tkinter never frees a tag_bind's callback
+        # (re-binding on every redraw slowly leaked memory).
+        for key, _label in self.ITEMS:
+            tag = f"item_{key}"
+            self.tag_bind(tag, "<Enter>", lambda e, k=key: self._hover(k, True))
+            self.tag_bind(tag, "<Leave>", lambda e, k=key: self._hover(k, False))
+            self.tag_bind(tag, "<ButtonRelease-1>", lambda e, k=key: self.on_select(k))
 
     def set_status(self, text):
         self.status = text
@@ -340,9 +347,6 @@ class Sidebar(tk.Canvas):
                 self.create_polygon(heart_points(30, y + 1, 18), fill=p["outline"], smooth=True, tags=(tag,))
             draw_outlined(self, 46, y, label, fonts["menu"], p["menu_hover"] if selected else p["menu_fg"],
                           p["outline"], width=3, anchor="w", tags=(tag,))
-            self.tag_bind(tag, "<Enter>", lambda e, t=tag, s=selected: self._hover(t, True, s))
-            self.tag_bind(tag, "<Leave>", lambda e, t=tag, s=selected: self._hover(t, False, s))
-            self.tag_bind(tag, "<ButtonRelease-1>", lambda e, k=key: self.on_select(k))
             y += 48
 
         self.create_text(22, h - 74, anchor="nw", text=self.status, width=w - 44, font=fonts["small"],
@@ -351,9 +355,10 @@ class Sidebar(tk.Canvas):
                          font=fonts["small_b"], fill=p["heading"], tags=("claimed",))
         self.configure(cursor="")
 
-    def _hover(self, tag, on, selected):
+    def _hover(self, key, on):
         p = self.app.p
-        self.itemconfigure(f"{tag}&&fill", fill=p["menu_hover"] if (on or selected) else p["menu_fg"])
+        selected = key == self.current
+        self.itemconfigure(f"item_{key}&&fill", fill=p["menu_hover"] if (on or selected) else p["menu_fg"])
         self.configure(cursor="hand2" if on else "")
 
     def _paper(self, cx, cy, text, angle, font):

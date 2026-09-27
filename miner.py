@@ -27,6 +27,26 @@ from twitch_api import (
 )
 
 CACHE_FILE = os.path.join(APP_DIR, "campaign_cache.json")
+CACHE_MAX_BYTES = 20 * 2**20  # a healthy cache is well under 1 MB
+MAX_NAME = 300                # longest reward name kept (real ones are < 100 characters)
+
+
+def _clean_name(name):
+    """Drop repeated ", "-separated parts (then cap the length)."""
+    parts = dict.fromkeys(p.strip() for p in (name or "").split(", ") if p.strip())
+    return ", ".join(parts)[:MAX_NAME]
+
+
+def load_cache():
+    """The campaign cache, or a fresh one if it's missing, unreadable or absurdly large.
+    v1.0.0-1.0.1 doubled reward names on every rescan, bloating it to many GB; the next save replaces it."""
+    try:
+        if os.path.getsize(CACHE_FILE) > CACHE_MAX_BYTES:
+            return {}
+    except OSError:
+        return {}
+    data = load_json(CACHE_FILE, {})
+    return data if isinstance(data, dict) else {}
 
 WATCH_INTERVAL = 59          # seconds between "minute-watched" reports
 INVENTORY_EVERY = 3          # watch ticks between inventory syncs (claims + progress)
@@ -85,8 +105,11 @@ class Drop:
         self.start = parse_ts(data.get("startAt"))
         self.end = parse_ts(data.get("endAt"))
         benefits = [e.get("benefit") or {} for e in data.get("benefitEdges") or []]
-        self.benefit_ids = [b.get("id") for b in benefits if b.get("id")]
-        self.rewards = ", ".join(b.get("name", "") for b in benefits if b.get("name")) or self.name
+        # Each reward keeps its own name (saved to the cache as-is). Names are de-duplicated and capped
+        # so a cache written by v1.0.0/1.0.1 (which doubled them on every rescan) can't grow again.
+        self.benefits = [(b.get("id"), _clean_name(b.get("name"))) for b in benefits]
+        self.benefit_ids = [bid for bid, _ in self.benefits if bid]
+        self.rewards = _clean_name(", ".join(name for _, name in self.benefits)) or self.name
         self.current = 0
         self.claimed = False
         self.instance_id = None
@@ -264,7 +287,7 @@ class Discovery:
         self.last_scan = 0
         self.version = 0             # bumps on every scan; stores re-adopt when it changes
         self.live = {}               # login (lower) -> True/False from the latest checks
-        self.cache = load_json(CACHE_FILE, {})  # campaign id -> what we learned about it
+        self.cache = load_cache()    # campaign id -> what we learned about it
         self._page_warned = set()
 
     def selected_slugs(self):
@@ -419,8 +442,8 @@ class Discovery:
                                    "requiredSubs": d.required_subs,
                                    "startAt": d.start.isoformat() if d.start else None,
                                    "endAt": d.end.isoformat() if d.end else None,
-                                   "benefitEdges": [{"benefit": {"id": bid, "name": d.rewards}}
-                                                    for bid in d.benefit_ids] or
+                                   "benefitEdges": [{"benefit": {"id": bid, "name": name}}
+                                                    for bid, name in d.benefits] or
                                                    [{"benefit": {"name": d.rewards}}]}
                                   for d in camp.drops]}
         entry = self.cache.get(camp.id) or {}

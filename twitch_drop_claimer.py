@@ -49,6 +49,7 @@ STATE_COLORS = {
     "Ended": "muted",
 }
 PAD = 16
+MAX_LOG_LINES = 2000
 
 
 # --------------------------------------------------------------------------
@@ -862,6 +863,9 @@ class App(tk.Tk):
         if who:
             self.log_box.insert("end", f"[{who}] ", "who")
         self.log_box.insert("end", msg + "\n", tag)
+        lines = int(self.log_box.index("end-1c").split(".")[0])
+        if lines > MAX_LOG_LINES:  # keep the console from growing forever while mining for days
+            self.log_box.delete("1.0", f"{lines - MAX_LOG_LINES}.0")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
