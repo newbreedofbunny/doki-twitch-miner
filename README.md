@@ -21,6 +21,9 @@ background (no video is downloaded). It can mine on several Twitch accounts at o
   so you can queue a streamer's drop even while they're offline.
 - **Multiple accounts at once**: tick "Mine" on as many accounts as you like. They share one
   campaign scan but keep their own progress and claims.
+- **Auto-claim per account**: untick an account's **Claim** box to collect its finished drops
+  yourself. They show as *Ready to claim* with a **Claim** button, while other accounts keep
+  claiming automatically.
 - **Picks up new campaigns by itself**: Twitch is rescanned regularly, and newly started
   campaigns for your games are mined automatically.
 - **Two themes**: *Doki Doki* (pink polka dots) and *Just Monika* (her starry space room).
@@ -56,11 +59,13 @@ Make sure each game's account is linked on
 
 | Problem | Fix |
 |---|---|
-| A red banner says watch time isn't reaching Twitch | Your DNS blocks `spade.twitch.tv`, which is where Twitch counts watch time. In Mullvad, turn off **both** the *Ads* and *Trackers* DNS content blockers; Pi-hole / AdGuard need it allow-listed. |
+| A red banner says watch time isn't reaching Twitch | Twitch's video servers (`*.ttvnw.net`) can't be reached. Twitch only counts watch time when the stream's video is requested, so check your connection, and make sure a VPN or ad-block DNS (Pi-hole, AdGuard, Mullvad content blockers) isn't blocking them. |
+| A drop is stuck at the same percentage | Twitch isn't counting that campaign at the moment. After 8 minutes without progress the miner skips it (one campaign for an hour, or the whole game for 2 hours if the game account isn't linked), then tries again. |
 | A campaign shows *Not progressing* | No progress for 8 minutes, usually because the game account isn't linked. Link it, then click **Refresh campaigns**. |
 | It's mining games I didn't pick | That's the **Also mine games I haven't picked** option (Settings → Mining). Untick it and the miner only mines your queue and picked games, and waits when they have nothing left. |
 | A streamer drop shows *Not started* | The streamer is live, but Twitch hasn't switched their drop on yet. It's retried on every rescan. |
 | Where are my settings? | `%APPDATA%\TwitchDropClaimer\` (settings, saved logins, downloaded fonts). |
+| Something went wrong and I want to report it | Attach `%APPDATA%\TwitchDropClaimer\miner.log`. It records what the console showed, plus a health line every 5 minutes (memory, handles, cache size). It stays around 1 MB and contains no passwords or login tokens. |
 
 ## Run from source
 

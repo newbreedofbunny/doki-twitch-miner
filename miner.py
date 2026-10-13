@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+import traceback
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -48,18 +49,21 @@ def load_cache():
     data = load_json(CACHE_FILE, {})
     return data if isinstance(data, dict) else {}
 
-WATCH_INTERVAL = 59          # seconds between "minute-watched" reports
+WATCH_INTERVAL = 60          # one bookkeeping "tick" (progress check etc.) per minute
+WATCH_SEND_EVERY = 20        # ... with a watch report every 20 s (what Twitch now expects)
 INVENTORY_EVERY = 3          # watch ticks between inventory syncs (claims + progress)
 PREEMPT_EVERY = 2            # watch ticks between "is something higher in the queue live?" checks
 STREAM_CHECK_EVERY = 5       # watch ticks between live / game checks of the watched channel
-STALL_TICKS = 8              # minutes without any progress before a game is skipped
+STALL_TICKS = 8              # minutes without any progress before a campaign / game is skipped
+STALL_RETRY_CAMPAIGN = 3600  # ... and how long it's skipped before trying again
+STALL_RETRY_GAME = 2 * 3600
 SCAN_CHANNELS = 3            # channels per category checked for campaigns
 SCAN_CHANNELS_DEEP = 30      # ... for picked / queued games (finds every streamer campaign)
 SCAN_WORKERS = 8
 MAX_LOGIN_CHECKS = 25        # live checks per preemption pass
 
 FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
-STATE_ORDER = ["Mining", "Queued", "Available", "Offline", "Not started", "Not progressing",
+STATE_ORDER = ["Mining", "Ready to claim", "Queued", "Available", "Offline", "Not started", "Not progressing",
                "Account not linked", "Upcoming", "Completed", "Ended"]
 
 
@@ -136,7 +140,14 @@ class Drop:
 
     @property
     def minable(self):
-        return not self.claimed and self.watchable and self.active
+        """Still needs watching. A fully-watched drop isn't minable even if nobody has claimed it yet
+        (auto-claim can be off for an account) - otherwise the miner would watch it forever."""
+        return not self.claimed and self.watchable and self.active and self.current < self.required
+
+    @property
+    def earned(self):
+        """Watched long enough; only claiming is left."""
+        return not self.claimed and self.watchable and self.required > 0 and self.current >= self.required
 
     @property
     def claimable(self):
@@ -232,6 +243,11 @@ class Campaign:
     @property
     def earnable(self):
         return self.linked and self.active and bool(self.remaining) and not self.not_started
+
+    @property
+    def ready(self):
+        """Drops that are fully watched and waiting to be claimed."""
+        return [d for d in self.drops if d.earned]
 
 
 def placeholder_campaign(item, logins, minutes, game_id, slug, game_name):
@@ -626,8 +642,32 @@ class CampaignStore:
         self.version = -1            # discovery version adopted
         self.target_id = None
         self.target_drop_id = None
-        self.stalled = set()         # game slugs that got no progress (usually: account not linked)
+        self.stalled = {}            # game slug or campaign id -> time until which it's skipped
         self.claimed_total = 0
+        self._ready_noted = set()    # drops we've already said are waiting to be claimed
+
+    @property
+    def autoclaim(self):
+        """Claim finished drops automatically for this account (the Accounts table's Claim box)."""
+        return self.client.login not in self.settings.get("autoclaim_disabled", [])
+
+    def is_stalled(self, camp):
+        now = time.time()
+        return self.stalled.get(camp.slug, 0) > now or self.stalled.get(camp.id, 0) > now
+
+    def mark_stalled(self, camp):
+        """No progress while watching `camp`. Returns "game" or "campaign" (what gets skipped).
+        If this account has earned progress in the game before, its account is clearly linked, so
+        only this campaign is skipped (for an hour); otherwise the whole game (for two hours).
+        Either way it's retried automatically - a Twitch hiccup must not stop mining for good."""
+        with self.lock:
+            linked = any(d.current > 0 or d.claimed for c in self.campaigns.values()
+                         if c.slug == camp.slug for d in c.drops)
+        if linked:
+            self.stalled[camp.id] = time.time() + STALL_RETRY_CAMPAIGN
+            return "campaign"
+        self.stalled[camp.slug] = time.time() + STALL_RETRY_GAME
+        return "game"
 
     @property
     def last_scan(self):
@@ -683,9 +723,11 @@ class CampaignStore:
 
     # -- Inventory -------------------------------------------------------------
     def sync_inventory(self):
-        """Claim every finished drop, then merge progress into the campaigns."""
+        """Claim every finished drop (if auto-claim is on for this account), then merge progress
+        into the campaigns."""
         inventory = self.client.get_inventory()
         claimed_any = False
+        autoclaim = self.autoclaim
         for raw in inventory.get("dropCampaignsInProgress") or []:
             game = (raw.get("game") or {})
             game_name = game.get("displayName") or game.get("name") or "?"
@@ -693,13 +735,13 @@ class CampaignStore:
                 drop = Drop(d)
                 if not drop.claimable:
                     continue
-                try:
-                    result = self.client.claim(drop.instance_id)
-                    claimed_any = True
-                    self.claimed_total += 1
-                    self.emit("log", f"CLAIMED: {drop.rewards} ({game_name}) - {result}")
-                except TwitchError as e:
-                    self.emit("log", f"Failed to claim {drop.rewards}: {e}")
+                if not autoclaim:
+                    if drop.id not in self._ready_noted:
+                        self._ready_noted.add(drop.id)
+                        self.emit("log", f"READY: {drop.rewards} ({game_name}) is ready to claim - auto-claim is "
+                                         "off for this account (use the Claim button on its card)")
+                    continue
+                claimed_any |= self._claim(drop, game_name)
         if claimed_any:
             inventory = self.client.get_inventory()
         with self.lock:
@@ -712,6 +754,35 @@ class CampaignStore:
                     self.campaigns[inv_camp.id] = inv_camp  # in progress but no live channel now
             apply_inventory(self.campaigns.values(), inventory)
         self.publish()
+
+    def _claim(self, drop, game_name, manual=False):
+        try:
+            result = self.client.claim(drop.instance_id)
+        except TwitchError as e:
+            self.emit("log", f"Failed to claim {drop.rewards}: {e}")
+            return False
+        self.claimed_total += 1
+        self._ready_noted.discard(drop.id)
+        self.emit("log", f"CLAIMED: {drop.rewards} ({game_name}){' (by hand)' if manual else ''} - {result}")
+        return True
+
+    def claim_now(self, drop_id):
+        """The Claim button: claim one finished drop right away, whatever the auto-claim setting."""
+        for raw in self.client.get_inventory().get("dropCampaignsInProgress") or []:
+            for d in raw.get("timeBasedDrops") or []:
+                if d.get("id") == drop_id:
+                    drop = Drop(d)
+                    game = raw.get("game") or {}
+                    if drop.claimable:
+                        self._claim(drop, game.get("displayName") or game.get("name") or "?", manual=True)
+                    elif drop.claimed:
+                        self.emit("log", f"{drop.rewards} was already claimed")
+                    else:
+                        self.emit("log", f"{drop.rewards} isn't ready to claim yet "
+                                         f"({drop.current}/{drop.required} min)")
+                    self.sync_inventory()
+                    return
+        self.emit("log", "Couldn't find that drop in your Twitch inventory - try Refresh campaigns")
 
     # -- Snapshots for the GUI ---------------------------------------------------
     def has_live_channel(self, c):
@@ -727,10 +798,10 @@ class CampaignStore:
         if not c.active:
             return "Upcoming" if c.start and c.start > utcnow() else "Ended"
         if not c.remaining:
-            return "Completed"
+            return "Ready to claim" if c.ready else "Completed"
         if c.not_started:
             return "Not started"
-        if c.slug in self.stalled:
+        if self.is_stalled(c):
             return "Not progressing"
         if not self.has_live_channel(c):
             return "Offline"
@@ -754,7 +825,7 @@ class CampaignStore:
                         continue
                     drops.append({"id": d.id, "name": d.rewards, "cur": min(d.current, d.required),
                                   "req": d.required, "claimed": d.claimed, "queued": queue_pos.get(d.id, 0),
-                                  "status": ("claimed" if d.claimed else "active" if d.active
+                                  "status": ("claimed" if d.claimed else "ready" if d.earned else "active" if d.active
                                              else "upcoming" if d.start and d.start > utcnow() else "expired")})
                 streamers = [(l, self.is_live(l)) for l in c.streamer_logins] if c.general is False else []
                 kind = "Streamer drop" if c.general is False else "General drop" if c.general else ""
@@ -775,6 +846,8 @@ class CampaignStore:
                     status = "Not found"
                 elif drop.claimed:
                     status = "Claimed"
+                elif drop.earned:
+                    status = "Ready to claim"
                 elif camp.id == self.target_id and (self.target_drop_id in (None, drop.id)):
                     status = "Mining"
                 elif not drop.minable or not camp.active:
@@ -835,7 +908,7 @@ class Miner:
         prefer = self.settings.get("prefer_streamer_drops", True)
 
         def usable(c):
-            return c.earnable and c.slug not in store.stalled
+            return c.earnable and not store.is_stalled(c)
 
         def kind_rank(c):
             return (0 if c.general is False else 1 if c.general is None else 2) if prefer else 0
@@ -926,10 +999,19 @@ class Miner:
 
     # -- Main loop -------------------------------------------------------------
     def run(self):
+        crashes = 0
         try:
-            self._run()
-        except Exception as e:  # keep the GUI informed about anything unexpected
-            self.log(f"Miner crashed: {e!r}")
+            while not self.stop_event.is_set():
+                try:
+                    self._run()
+                    break
+                except Exception as e:  # anything unexpected: say so, then carry on mining
+                    crashes += 1
+                    wait = min(crashes, 10)
+                    self.log(f"WARNING: miner hit an unexpected error ({e!r}) - restarting in {wait} min")
+                    self.emit("traceback", traceback.format_exc())
+                    if not self.sleep(wait * 60):
+                        break
         finally:
             self.store.target_id = self.store.target_drop_id = None
             self.store.publish()
@@ -1021,6 +1103,7 @@ class Miner:
         tick = 0
         fails = 0
         baseline = {d.id: (d.current, d.claimed) for d in camp.drops}
+        session_start = {}           # dropID -> minutes Twitch reported when we first saw it this session
         progress_seen = False
         self._progress(camp, self.channel, drop)
         while not self.stop_event.is_set():
@@ -1033,7 +1116,6 @@ class Miner:
                 else:
                     fails += 1
                     self.log(f"Watch report rejected ({fails}/3)")
-                    self.client.spade_url = None
                     if fails >= 3:
                         return True
 
@@ -1041,7 +1123,10 @@ class Miner:
                 _, session_drop = self.store.find_drop((session or {}).get("dropID"))
                 if session and session_drop:
                     cur = int(session.get("currentMinutesWatched") or 0)
-                    if cur > 0:
+                    # Progress means the minutes go UP while we watch. (Counting any non-zero value hid a
+                    # drop stuck at 139/240 for two days.)
+                    first = session_start.setdefault(session_drop.id, cur)
+                    if cur > first:
                         progress_seen = True
                     session_drop.current = max(session_drop.current, cur)
 
@@ -1055,11 +1140,15 @@ class Miner:
                         progress_seen = True
                 self._progress(camp, ch, drop, session_drop)
 
-                if not progress_seen and tick >= STALL_TICKS and self.client.watch_mode == "spade":
-                    self.store.stalled.add(camp.slug)
-                    self.log(f"No progress on {camp.game_name} after {STALL_TICKS} minutes - usually the "
-                             f"game account isn't linked ({DROPS_PAGE_URL}). Skipping it until the next "
-                             "'Refresh campaigns'.")
+                # Only blame the campaign when our own watch reports are getting through.
+                if not progress_seen and tick >= STALL_TICKS and fails == 0 and not self.client.video_error:
+                    if self.store.mark_stalled(camp) == "campaign":
+                        self.log(f"No progress on '{camp.name}' after {STALL_TICKS} minutes - skipping this "
+                                 "campaign for an hour (other campaigns keep mining).")
+                    else:
+                        self.log(f"No progress on {camp.game_name} after {STALL_TICKS} minutes - usually the "
+                                 f"game account isn't linked ({DROPS_PAGE_URL}). Skipping the game for 2 hours; "
+                                 "'Refresh campaigns' retries it right away.")
                     self.store.target_id = self.store.target_drop_id = None
                     self.store.publish()
                     return True
@@ -1090,24 +1179,30 @@ class Miner:
                 if self._fatal(e):
                     return False
 
-            next_at = datetime.fromtimestamp(time.time() + WATCH_INTERVAL).strftime("%H:%M:%S")
-            self.status(f"Mining {camp.game_name} - next watch report at {next_at}")
-            self.wake.wait(WATCH_INTERVAL)
-            if self.wake.is_set():  # refresh / queue changed: re-pick right away
+            self.status(f"Mining {camp.game_name} on {ch['display']} - watch reports every {WATCH_SEND_EVERY} s")
+            # The rest of this minute: a watch report every WATCH_SEND_EVERY seconds.
+            for _ in range(WATCH_INTERVAL // WATCH_SEND_EVERY - 1):
+                if self.wake.wait(WATCH_SEND_EVERY):
+                    break
+                try:
+                    self.client.send_watch(ch)
+                except TwitchError:
+                    pass
+            if self.wake.is_set() or self.wake.wait(WATCH_SEND_EVERY):  # refresh / queue changed: re-pick now
                 self.wake.clear()
                 return not self.stop_event.is_set()
         return False
 
     def _report_blocking(self):
-        blocked = self.client.watch_mode != "spade"
+        blocked = bool(self.client.video_error)
         if blocked != self.blocked:
             self.blocked = blocked
             self.emit("blocked", blocked)
         if not blocked and self.blocked_warned:
             self.blocked_warned = False
-            self.log("spade.twitch.tv is reachable again - watch time is being counted")
+            self.log("Twitch's video servers are reachable again - watch time is being counted")
         elif blocked and not self.blocked_warned:
             self.blocked_warned = True
-            self.log("WARNING: spade.twitch.tv (where Twitch counts watch time) can't be reached. "
-                     "It's blocked by your DNS - e.g. Mullvad's Ads or Trackers content blockers, Pi-hole "
-                     "or AdGuard. Drops will NOT progress until it's unblocked.")
+            self.log(f"WARNING: can't reach Twitch's video servers ({self.client.video_error}). Watch time only "
+                     "counts when the stream's video is requested, so drops won't progress until this works "
+                     "(check your connection, VPN or ad-block DNS).")

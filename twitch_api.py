@@ -5,7 +5,7 @@ Only the Python standard library is used.
 """
 
 import base64
-import gzip
+import http.client
 import json
 import os
 import re
@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 # Settings. Twitch changes the GQL hashes from time to time; if requests start
 # failing with "PersistedQueryNotFound", update them in settings.json.
 # --------------------------------------------------------------------------
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.5"
 
 DEFAULTS = {
     "client_id": "ue6666qo983tsx6so1t0vnawi233wa",  # Twitch Android TV app (supports device login)
@@ -42,6 +42,7 @@ DEFAULTS = {
     "game_slugs": {},            # picked game name -> Twitch category slug
     "drop_queue": [],            # specific drops to mine first, in order
     "mining_disabled": [],       # account logins unticked in the Accounts table (all others mine)
+    "autoclaim_disabled": [],    # account logins whose finished drops are left for you to claim
     "prefer_streamer_drops": True,  # within a game, streamer-specific drops before general ones
     "mine_unselected": False,    # mine other campaigns when the picked games have nothing
     "mine_unselected_confirmed": False,  # set when the user OKs the "mine games I haven't picked" prompt
@@ -190,9 +191,9 @@ class TwitchClient:
         self.user_id = account.get("user_id")
         self.session_id = uuid.uuid4().hex[:16]
         self.spade_url = None
-        self.watch_mode = "spade"  # falls back to "gql" if the tracking host is blocked
-        self._spade_retry_at = 0
+        self._last_spade = 0
         self._hls = None           # (login, media playlist url, fetched_at)
+        self.video_error = None    # set while Twitch's video servers can't be reached
 
     # -- HTTP helpers ------------------------------------------------------
     def _base_headers(self):
@@ -230,6 +231,10 @@ class TwitchClient:
                 return e.code, {}
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             raise TwitchError(f"Network error: {getattr(e, 'reason', e)}") from e
+        except (http.client.HTTPException, OSError, ValueError) as e:
+            # e.g. a maintenance / captive-portal page instead of JSON, or a download cut off half-way.
+            # Must surface as TwitchError so callers retry instead of crashing.
+            raise TwitchError(f"Unexpected response from {urllib.parse.urlsplit(url).netloc}: {e!r}") from e
 
     # -- Auth --------------------------------------------------------------
     def validate(self):
@@ -416,73 +421,92 @@ class TwitchClient:
         return match.group(1)
 
     def send_watch(self, channel):
-        """Report one minute watched on `channel`. Returns True on success.
+        """Report watching `channel` (call every ~20 s). Returns True if Twitch's video servers
+        answered for every segment.
 
-        Twitch counts watch time through its tracking endpoint (spade.twitch.tv).
-        If that host is unreachable (commonly blocked by VPN / ad-block DNS) the
-        event is relayed through the GQL API instead, which Twitch accepts but
-        does not appear to count - so the caller warns the user about it.
+        Since early Oct 2026 Twitch only counts watch time when the stream's video is actually
+        requested; the spade "minute-watched" event alone no longer counts. So, like
+        TwitchDropsMiner (commit f693b0c), fetch the live playlist and HEAD every video segment
+        in it - HEAD only asks for the segment, nothing is downloaded. The spade event is still
+        sent once a minute, best effort.
         """
-        event = self._watch_event(channel)
-        ok = False
-        if self.watch_mode == "gql" and time.time() >= self._spade_retry_at:
-            self.watch_mode = "spade"  # periodically re-check whether it's been unblocked
-        if self.watch_mode == "spade":
-            try:
-                if self.spade_url is None:
-                    self.spade_url = self._get_spade_url(channel["login"])
-                encoded = base64.b64encode(json.dumps(event, separators=(",", ":")).encode()).decode()
-                status, _ = self._request(
-                    self.spade_url, {"data": encoded}, headers={"User-Agent": WEB_USER_AGENT},
-                    form=True, raw=True,
-                )
-                ok = status == 204
-            except TwitchError:
-                self.watch_mode = "gql"  # tracking host blocked/unreachable
-                self._spade_retry_at = time.time() + 300
-        if not ok:
-            ok = self._send_watch_gql(event)
-        self._touch_stream(channel)
+        ok = self._watch_playlist(channel)
+        if time.time() - self._last_spade >= 55:
+            self._last_spade = time.time()
+            self._send_spade(channel)
         return ok
 
-    def _send_watch_gql(self, event):
-        data = base64.b64encode(gzip.compress(json.dumps(event, separators=(",", ":")).encode())).decode()
-        query = ("\n mutation SendEvents($input: SendSpadeEventsInput!) "
-                 "{\n sendSpadeEvents(input: $input) {\n statusCode\n}\n}\n")
-        status, resp = self._request(
-            GQL_URL, {"query": query, "variables": {"input": {"data": data}}},
-            headers={"Authorization": f"OAuth {self.token}", "Client-Session-Id": self.session_id},
-        )
-        result = ((resp.get("data") or {}).get("sendSpadeEvents") or {}) if isinstance(resp, dict) else {}
-        return status == 200 and result.get("statusCode") == 204
-
-    def _touch_stream(self, channel):
-        """Best effort: fetch the live playlist and HEAD the newest video chunk."""
+    def _send_spade(self, channel):
         try:
-            cached = self._hls
-            if not cached or cached[0] != channel["login"] or time.time() - cached[2] > 600:
-                data = self.gql("PlaybackAccessToken", {
-                    "isLive": True, "isVod": False, "login": channel["login"],
-                    "platform": "web", "playerType": "site", "vodID": "",
-                })
-                tok = data.get("streamPlaybackAccessToken") or {}
-                if not tok:
-                    return
-                url = (f"https://usher.ttvnw.net/api/channel/hls/{channel['login']}.m3u8?"
-                       + urllib.parse.urlencode({"sig": tok["signature"], "token": tok["value"]}))
-                status, master = self._request(url, raw=True)
-                variants = [l for l in master.strip().split("\n") if l and not l.startswith("#")]
-                if status != 200 or not variants:
-                    return
-                cached = self._hls = (channel["login"], variants[-1], time.time())
-            status, media = self._request(cached[1], raw=True, headers={"Connection": "close"})
-            chunks = [l for l in media.strip().split("\n") if l and not l.startswith("#")]
-            if status != 200 or not chunks:
-                self._hls = None
-                return
-            urllib.request.urlopen(urllib.request.Request(chunks[-1], method="HEAD"), timeout=20).close()
-        except Exception:
+            if self.spade_url is None:
+                self.spade_url = self._get_spade_url(channel["login"])
+            event = self._watch_event(channel)
+            encoded = base64.b64encode(json.dumps(event, separators=(",", ":")).encode()).decode()
+            self._request(self.spade_url, {"data": encoded}, headers={"User-Agent": WEB_USER_AGENT},
+                          form=True, raw=True)
+        except TwitchError:
+            self.spade_url = None  # often blocked by ad-block DNS; not needed for progress any more
+
+    def _playlist_url(self, channel):
+        """The stream's media playlist URL (cached ~10 min; the access token is short-lived)."""
+        cached = self._hls
+        if cached and cached[0] == channel["login"] and time.time() - cached[2] < 600:
+            return cached[1]
+        data = self.gql("PlaybackAccessToken", {
+            "isLive": True, "isVod": False, "login": channel["login"],
+            "platform": "web", "playerType": "site", "vodID": "",
+        })
+        tok = data.get("streamPlaybackAccessToken") or {}
+        if not tok:
+            return None
+        url = (f"https://usher.ttvnw.net/api/channel/hls/{channel['login']}.m3u8?"
+               + urllib.parse.urlencode({"sig": tok["signature"], "token": tok["value"]}))
+        status, master = self._request(url, raw=True)
+        variants = [l.strip() for l in master.splitlines() if l.startswith("http")]
+        if status != 200 or not variants:
+            return None  # offline (usher answers 404) or not watchable
+        self._hls = (channel["login"], variants[-1], time.time())  # last = smallest quality
+        return variants[-1]
+
+    def _watch_playlist(self, channel):
+        try:
+            url = self._playlist_url(channel)
+            if not url:
+                return False
+            status, media = self._request(url, raw=True)
+            segments = [l.strip() for l in media.splitlines() if l.startswith("http")]
+            if status != 200 or not segments:
+                self._hls = None  # stream ended or token expired: get a fresh playlist next time
+                return False
+            ok = self._head_all(segments)
+            self.video_error = None
+            return ok
+        except TwitchError as e:
             self._hls = None
+            self.video_error = str(e)
+            return False
+
+    def _head_all(self, urls):
+        """HEAD each URL, reusing one connection per server. True if all answered 200."""
+        conns = {}
+        try:
+            for url in urls:
+                parts = urllib.parse.urlsplit(url)
+                conn = conns.get(parts.netloc)
+                if conn is None:
+                    conn = conns[parts.netloc] = http.client.HTTPSConnection(parts.netloc, timeout=20)
+                conn.request("HEAD", parts.path + (f"?{parts.query}" if parts.query else ""),
+                             headers={"User-Agent": WEB_USER_AGENT})
+                resp = conn.getresponse()
+                resp.read()
+                if resp.status != 200:
+                    return False
+            return True
+        except (OSError, http.client.HTTPException) as e:
+            raise TwitchError(f"Network error reaching Twitch's video servers: {e!r}") from e
+        finally:
+            for conn in conns.values():
+                conn.close()
 
     def _watch_event(self, channel):
         return [{

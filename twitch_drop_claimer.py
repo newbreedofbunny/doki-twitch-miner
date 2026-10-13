@@ -24,10 +24,10 @@ from datetime import datetime
 from tkinter import ttk, messagebox
 
 from twitch_api import (
-    APP_VERSION, AccountStore, CLIENT_URL, DROPS_PAGE_URL, SETTINGS_FILE, TwitchClient, TwitchError,
+    APP_DIR, APP_VERSION, AccountStore, CLIENT_URL, DROPS_PAGE_URL, SETTINGS_FILE, TwitchClient, TwitchError,
     game_slug, load_settings, save_json,
 )
-from miner import CampaignStore, Discovery, Miner, fmt_minutes
+from miner import CACHE_FILE, CampaignStore, Discovery, Miner, fmt_minutes
 from doki_theme import (
     ASSETS, MASCOT_H, MASCOT_W, PALETTES, DotCanvas, MenuButton, Sidebar, download_fonts, load_private_fonts,
     make_fonts, missing_fonts, refresh_fonts,
@@ -42,14 +42,17 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "TwitchDropMiner"
 APP_ID = "Moni.TwitchDropMiner"  # taskbar identity; must match the desktop shortcut's AppUserModelID
 FILTERS = ["All campaigns", "Queued drops", "Streamer drops", "Picked games", "Available to mine",
-           "Completed"]
+           "Ready to claim", "Completed"]
 STATE_COLORS = {
-    "Mining": "accent", "Queued": "fg", "Available": "muted", "Offline": "muted", "Not started": "muted",
+    "Mining": "accent", "Ready to claim": "success", "Queued": "fg", "Available": "muted", "Offline": "muted", "Not started": "muted",
     "Not progressing": "warn", "Account not linked": "danger", "Upcoming": "muted", "Completed": "success",
     "Ended": "muted",
 }
 PAD = 16
 MAX_LOG_LINES = 2000
+LOG_FILE = os.path.join(APP_DIR, "miner.log")   # what the console shows + a health line every 5 minutes
+LOG_MAX_BYTES = 1_000_000                       # then it's rotated to miner.log.1
+MEM_WARN_MB, MEM_QUIT_MB = 1024, 3072           # normal use is ~50 MB
 
 
 # --------------------------------------------------------------------------
@@ -100,6 +103,76 @@ def set_app_id():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
     except Exception:
         pass
+
+
+_instance_mutex = None
+
+
+def already_running():
+    """True if another copy of the app is open (two copies would mine the same accounts twice
+    and overwrite each other's settings)."""
+    global _instance_mutex
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        _instance_mutex = kernel32.CreateMutexW(None, False, "Local\\DokiTwitchMiner.SingleInstance")
+        return ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        return False
+
+
+def focus_existing_window():
+    """Bring the already-open app window to the front."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32")
+        found = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def each(hwnd, _lparam):
+            title = ctypes.create_unicode_buffer(200)
+            user32.GetWindowTextW(hwnd, title, 200)
+            if title.value.startswith("Twitch Drop Miner") and user32.IsWindowVisible(hwnd):
+                found.append(hwnd)
+            return True
+        user32.EnumWindows(each, 0)
+        for hwnd in found[:1]:
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
+def process_stats():
+    """(private memory in MB, GDI objects, USER objects) of this process - zeros if unavailable."""
+    if sys.platform != "win32":
+        return 0.0, 0, 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class Counters(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+                (name, ctypes.c_size_t) for name in (
+                    "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                    "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage",
+                    "PeakPagefileUsage", "PrivateUsage")]
+
+        kernel32, psapi, user32 = ctypes.WinDLL("kernel32"), ctypes.WinDLL("psapi"), ctypes.WinDLL("user32")
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+        user32.GetGuiResources.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        handle = kernel32.GetCurrentProcess()
+        counters = Counters()
+        counters.cb = ctypes.sizeof(Counters)
+        psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+        return counters.PrivateUsage / 2**20, user32.GetGuiResources(handle, 0), user32.GetGuiResources(handle, 1)
+    except Exception:
+        return 0.0, 0, 0
 
 
 def set_titlebar_dark(window, dark):
@@ -174,7 +247,7 @@ class CampaignCard:
             text = ttk.Label(self.body, style="CardMuted.TLabel", width=14, anchor="e")
             text.grid(row=i, column=2, sticky="e", pady=2)
             btn = ttk.Button(self.body, style="Small.TButton", width=9,
-                             command=lambda drop_id=d["id"]: self.app.on_queue_toggle(self.data, drop_id))
+                             command=lambda drop_id=d["id"]: self.app.on_drop_button(self.data, drop_id))
             btn.grid(row=i, column=3, sticky="e", padx=(10, 0), pady=1)
             btn.bind("<Button-3>", lambda e, drop_id=d["id"]: self.app.queue_context_for_drop(drop_id, e))
             self.rows[d["id"]] = (bar, text, btn)
@@ -219,6 +292,9 @@ class CampaignCard:
             if d["claimed"]:
                 bar.configure(value=100, style="Done.Horizontal.TProgressbar")
                 text.configure(text="Claimed ♥", style="CardSuccess.TLabel")
+            elif d["status"] == "ready":
+                bar.configure(value=100, style="Accent.Horizontal.TProgressbar")
+                text.configure(text="Ready to claim", style="CardSuccess.TLabel")
             else:
                 bar.configure(value=100 * d["cur"] / d["req"] if d["req"] else 0,
                               style="Accent.Horizontal.TProgressbar" if d["status"] == "active"
@@ -226,7 +302,9 @@ class CampaignCard:
                 label = {"active": f"{d['cur']}/{d['req']} min", "upcoming": "Not started",
                          "expired": "Expired"}[d["status"]]
                 text.configure(text=label, style="CardMuted.TLabel")
-            if d["queued"]:
+            if d["status"] == "ready":
+                btn.configure(text="Claim ♥", style="SmallAccent.TButton", state="normal")
+            elif d["queued"]:
                 btn.configure(text=f"#{d['queued']}  ✕", style="SmallAccent.TButton", state="normal")
             else:
                 btn.configure(text="+ Queue", style="Small.TButton",
@@ -237,7 +315,7 @@ class CampaignCard:
     def refresh_theme(self):
         p, fonts = self.app.p, self.app.fonts
         color = p[STATE_COLORS.get(self.state, "muted")]
-        filled = self.state in ("Mining", "Completed", "Account not linked", "Not progressing")
+        filled = self.state in ("Mining", "Ready to claim", "Completed", "Account not linked", "Not progressing")
         self.badge.configure(text=self.state, font=fonts["badge"], bg=color if filled else p["panel"],
                              fg="#ffffff" if filled else color)
         if self.kind_text:
@@ -299,6 +377,9 @@ class App(tk.Tk):
         self.view = None             # the session whose progress / campaigns the UI shows
         self.mining = False          # Start mining pressed (applies to every account ticked "Mine")
         self.login_cancel = threading.Event()
+        self.closing = threading.Event()   # set on exit; background retry loops watch it
+        self._beats = 0
+        self._mem_warned = False
         self.cards = {}
         self.card_order = []
         self.game_vars = {}
@@ -335,6 +416,9 @@ class App(tk.Tk):
         self.bind_all("<MouseWheel>", self._on_wheel, add="+")
         self.after(100, self._process_events)
         self.after(60_000, self._idle_rescan)
+        self.after(60_000, self._heartbeat)
+        self._file_log(f"Started v{APP_VERSION} ({'exe' if getattr(sys, 'frozen', False) else 'source'}), "
+                       f"Python {sys.version.split()[0]}, {len(self.accounts.accounts)} account(s)")
         if autostart and self.settings.get("start_minimized"):
             self.iconify()
         self.after(150, self._restore_account)
@@ -388,9 +472,10 @@ class App(tk.Tk):
 
         outer, acc = self.panel(pg, "Accounts")
         outer.grid(row=0, column=0, sticky="nsew", padx=(PAD, 8), pady=(PAD, 8))
-        self.acct_tree = ttk.Treeview(acc, columns=("mine", "account", "status"), show="headings", height=3,
-                                      selectmode="browse")
+        self.acct_tree = ttk.Treeview(acc, columns=("mine", "claim", "account", "status"), show="headings",
+                                      height=3, selectmode="browse")
         for col, text, width, anchor, stretch in (("mine", "Mine", 50, "center", False),
+                                                  ("claim", "Claim", 52, "center", False),
                                                   ("account", "Account", 130, "w", False),
                                                   ("status", "Status", 230, "w", True)):
             self.acct_tree.heading(col, text=text)
@@ -417,14 +502,15 @@ class App(tk.Tk):
         ttk.Label(ctl, textvariable=self.mining_summary_var, style="Link.TLabel").pack(anchor="w", pady=(6, 0))
         self.mining_status_var = tk.StringVar(value="Idle")
         ttk.Label(ctl, textvariable=self.mining_status_var, style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
-        ttk.Label(ctl, text="Start mining runs every account ticked \"Mine\". Click an account to see its "
-                            "progress and campaigns below.", style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
+        ttk.Label(ctl, text="Start mining runs every account ticked \"Mine\". Untick \"Claim\" to collect an "
+                            "account's drops yourself. Click an account to see its progress and campaigns below.",
+                  style="Muted.TLabel", wraplength=560, justify="left").pack(anchor="w", pady=(2, 0))
 
         self.blocked_banner = tk.Label(
             pg, anchor="w", justify="left", padx=12, pady=8, wraplength=1000,
-            text="Watch time isn't reaching Twitch: spade.twitch.tv is blocked by your DNS "
-                 "(Mullvad: turn off BOTH the Ads and Trackers DNS content blockers; or Pi-hole / AdGuard). "
-                 "Drops won't progress until it's unblocked - this clears by itself within ~5 minutes.")
+            text="Watch time isn't reaching Twitch: the stream's video servers can't be reached. Drops only "
+                 "progress when the video is requested - check your connection, VPN or ad-block DNS. "
+                 "This clears by itself once they're reachable again.")
         self.blocked_banner.grid(row=1, column=0, columnspan=3, sticky="ew", padx=PAD, pady=(0, 8))
         self.blocked_banner.grid_remove()
         self.tk_widgets.append((self.blocked_banner, "banner"))
@@ -632,8 +718,8 @@ class App(tk.Tk):
         for tip in (
             "♥  Link the game's account on Twitch, otherwise Twitch counts nothing. Campaigns that get no "
             "progress for 8 minutes are marked \"Not progressing\" and skipped.",
-            "♥  Watch time is sent to spade.twitch.tv. VPN / ad-block DNS must not block it "
-            "(Mullvad: turn off the Ads and Trackers content blockers).",
+            "♥  Watch time only counts when the stream's video is requested from Twitch's video servers "
+            "(*.ttvnw.net) - a VPN or ad-block DNS must not block them.",
         ):
             ttk.Label(help_, text=tip, wraplength=760, justify="left").pack(anchor="w", pady=2)
         link = ttk.Label(help_, text="Open twitch.tv/drops/campaigns to link accounts", style="Link.TLabel",
@@ -849,15 +935,53 @@ class App(tk.Tk):
             pass
         self.after(100, self._process_events)
 
+    def _file_log(self, text):
+        """Append to miner.log - a record to look at after a problem (kept to ~1 MB plus one older file)."""
+        try:
+            if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+                os.replace(LOG_FILE, LOG_FILE + ".1")
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {text}\n")
+        except OSError:
+            pass
+
+    def _heartbeat(self):
+        """Every minute: watch our own memory. Every 5 minutes: write a health line to miner.log."""
+        mem, gdi, user = process_stats()
+        self._beats += 1
+        if self._beats % 5 == 1 or mem > MEM_WARN_MB:
+            try:
+                cache_kb = os.path.getsize(CACHE_FILE) / 1024
+            except OSError:
+                cache_kb = 0
+            mining = ",".join(s.name for s in self.sessions if s.miner) or "no"
+            self._file_log(f"STATS memory={mem:.0f}MB gdi={gdi} user={user} threads={threading.active_count()} "
+                           f"cache={cache_kb:.0f}KB campaigns={len(self.cards)} queued_events={self.events.qsize()} "
+                           f"mining={mining}")
+        if mem > MEM_QUIT_MB:
+            self._file_log(f"Memory use reached {mem:.0f} MB (normal is about 50 MB) - closing the app so it "
+                           "can't slow the PC down. Please report this with miner.log.")
+            self.on_close()
+            return
+        if mem > MEM_WARN_MB and not self._mem_warned:
+            self._mem_warned = True
+            self._ui_log(f"WARNING: this app is using {mem:.0f} MB of memory (normal is about 50 MB). "
+                         f"It will close itself at {MEM_QUIT_MB} MB. Details are in {LOG_FILE}")
+        self.after(60_000, self._heartbeat)
+
+    def _sess_traceback(self, s, text):
+        self._file_log(f"[{s.name}] {text.strip()}")
+
     def _on_tk_error(self, exc, val, tb):
         self._ui_log("Internal error: " + "".join(traceback.format_exception(exc, val, tb)).strip())
 
     # -- UI handlers ------------------------------------------------------------
     def _ui_log(self, msg, who=None):
-        tag = "good" if msg.startswith(("CLAIMED", "New campaign")) else \
+        tag = "good" if msg.startswith(("CLAIMED", "New campaign", "READY")) else \
               "warn" if msg.startswith(("WARNING", "No progress", "Failed")) else None
         if msg.startswith("CLAIMED"):
             msg = "♥ " + msg
+        self._file_log((f"[{who}] " if who else "") + msg)
         self.log_box.configure(state="normal")
         self.log_box.insert("end", datetime.now().strftime("%H:%M:%S  "), "time")
         if who:
@@ -1057,11 +1181,21 @@ class App(tk.Tk):
         emit = self.emitter(s)
 
         def check():
-            try:
-                ok = s.client.validate()
-            except TwitchError as e:
-                emit("log", str(e))
-                ok = False
+            # A failed *connection* is not an expired login: when the app starts with Windows the
+            # network / VPN is often not up yet. Keep retrying until Twitch actually answers.
+            attempt = 0
+            while not self.closing.is_set() and s in self.sessions:
+                try:
+                    ok = s.client.validate()
+                    break
+                except TwitchError as e:
+                    attempt += 1
+                    if attempt == 1:
+                        emit("log", f"Can't reach Twitch yet ({e}) - retrying until the connection is up")
+                    emit("status", "Waiting for the network...")
+                    self.closing.wait(min(15 * attempt, 60))
+            else:
+                return
             emit("account_ready", ok)
         self._bg(check)
         self._refresh_accounts_table()
@@ -1131,7 +1265,7 @@ class App(tk.Tk):
         for s in self.sessions:
             enabled = self._mine_enabled(s)
             if s.state == "checking":
-                status = "Checking login..."
+                status = s.status or "Checking login..."
             elif s.state == "expired":
                 status = "Login expired - use Add account"
             elif s.miner:
@@ -1143,7 +1277,8 @@ class App(tk.Tk):
             else:
                 status = "Idle"
             tag = "mining" if s.miner else "off" if (not enabled or s.state == "expired") else ""
-            tree.insert("", "end", iid=str(id(s)), values=("☑" if enabled else "☐", s.name, status),
+            claim = "☑" if self._claim_enabled(s) else "☐"
+            tree.insert("", "end", iid=str(id(s)), values=("☑" if enabled else "☐", claim, s.name, status),
                         tags=(tag,) if tag else ())
         if self.view in self.sessions:
             tree.selection_set(str(id(self.view)))
@@ -1158,12 +1293,15 @@ class App(tk.Tk):
         self.mining_summary_var.set(summary)
 
     def _on_acct_click(self, event):
-        """Click a row to view that account; click the Mine box to include / exclude it."""
+        """Click a row to view that account; click the Mine / Claim boxes to switch them."""
         tree = self.acct_tree
         s = next((x for x in self.sessions if str(id(x)) == tree.identify_row(event.y)), None)
         if s is not None:
-            if tree.identify_column(event.x) == "#1":
+            column = tree.identify_column(event.x)
+            if column == "#1":
                 self._toggle_mine(s)
+            elif column == "#2":
+                self._toggle_claim(s)
             elif s is not self.view:
                 self._set_view(s)
         return "break"  # selection always follows the viewed account
@@ -1184,6 +1322,44 @@ class App(tk.Tk):
                 self._stop_session(s)
         self._refresh_accounts_table()
         self._update_start_button()
+
+    def _claim_enabled(self, s):
+        return s.login not in self.settings.get("autoclaim_disabled", [])
+
+    def _toggle_claim(self, s):
+        """Auto-claim on/off for one account (the others are unaffected)."""
+        if not s.login:
+            return
+        disabled = set(self.settings.get("autoclaim_disabled", []))
+        enable = s.login in disabled
+        (disabled.discard if enable else disabled.add)(s.login)
+        self.settings["autoclaim_disabled"] = sorted(disabled)  # replaced atomically; the stores read it
+        save_json(SETTINGS_FILE, self.settings)
+        if enable:
+            self.log(f"Auto-claim on for {s.login} - claiming anything that's waiting")
+            if s.state == "ready":
+                self._bg(self._safe_store_call, s, s.store.sync_inventory)  # claim waiting drops now
+        else:
+            self.log(f"Auto-claim off for {s.login} - finished drops will wait for you "
+                     "(Claim button on the campaign card)")
+        self._refresh_accounts_table()
+
+    def _safe_store_call(self, s, fn, *args):
+        try:
+            fn(*args)
+        except TwitchError as e:
+            s.store.emit("log", f"Couldn't reach Twitch: {e}")
+
+    def on_drop_button(self, card_data, drop_id):
+        """The button on each drop row: Claim when it's ready, otherwise add to / remove from the queue."""
+        drop = next(d for d in card_data["drops"] if d["id"] == drop_id)
+        if drop["status"] == "ready":
+            s = self.view
+            if s and s.state == "ready":
+                self.log(f"Claiming {drop['name']} for {s.name}...")
+                self._bg(self._safe_store_call, s, s.store.claim_now, drop_id)
+        else:
+            self.on_queue_toggle(card_data, drop_id)
 
     def on_add_account(self):
         self.add_btn.set(state="disabled")
@@ -1358,6 +1534,8 @@ class App(tk.Tk):
                 continue
             if mode == "Available to mine" and card.state not in ("Mining", "Queued", "Available"):
                 continue
+            if mode == "Ready to claim" and not any(d["status"] == "ready" for d in card.data["drops"]):
+                continue
             if mode == "Completed" and card.state != "Completed":
                 continue
             shown.append(card)
@@ -1442,6 +1620,7 @@ class App(tk.Tk):
 
     # -- Drop queue -------------------------------------------------------------
     QUEUE_COLORS = {"Mining": "accent", "Live": "accent", "Offline": "muted", "Claimed": "success",
+                    "Ready to claim": "success",
                     "Expired": "muted", "Not found": "muted", "Not linked": "danger", "Not started": "muted",
                     "": "muted"}
 
@@ -1465,7 +1644,8 @@ class App(tk.Tk):
         ql.delete(0, "end")
         for i, row in enumerate(rows, 1):
             status = row["status"]
-            mark = {"Mining": "▶", "Live": "●", "Claimed": "♥"}.get(status, "○")
+            mark = {"Mining": "▶", "Live": "●", "Claimed": "♥",
+                    "Ready to claim": "★"}.get(status, "○")
             ql.insert("end", f" {mark} {i}. {row['label']}" + (f"   — {status}" if status else ""))
             ql.itemconfigure(i - 1, foreground=self.p[self.QUEUE_COLORS.get(status, "fg")])
         self._queue_ids = [r["drop_id"] for r in rows]
@@ -1707,10 +1887,15 @@ class App(tk.Tk):
 
     def on_close(self):
         self.login_cancel.set()
+        self.closing.set()
+        self._file_log("Closed")
         for s in self.sessions:
             self._stop_session(s)
         self.destroy()
 
 
 if __name__ == "__main__":
+    if already_running():
+        focus_existing_window()
+        sys.exit(0)
     App(autostart="--autostart" in sys.argv).mainloop()
