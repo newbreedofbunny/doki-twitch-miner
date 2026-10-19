@@ -9,18 +9,20 @@ import http.client
 import json
 import os
 import re
+import ssl
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 
 # --------------------------------------------------------------------------
 # Settings. Twitch changes the GQL hashes from time to time; if requests start
 # failing with "PersistedQueryNotFound", update them in settings.json.
 # --------------------------------------------------------------------------
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 
 DEFAULTS = {
     "client_id": "ue6666qo983tsx6so1t0vnawi233wa",  # Twitch Android TV app (supports device login)
@@ -160,7 +162,8 @@ VIDEO_ERROR_HELP = [
      "A proxy, firewall or VPN is in the way - try without them."),
     (("10054", "10053", "connectionreset", "connectionaborted", "remotedisconnected"),
      "the connection to Twitch's video servers keeps getting cut",
-     "Usually a VPN or an unstable connection - try without the VPN or on another network."),
+     "Usually a VPN, an antivirus 'web shield' / HTTPS scanning, or unstable Wi-Fi. Try without the VPN, pause "
+     "the web shield (or add an exception for DokiTwitchMiner.exe), restart the router or use Ethernet."),
 ]
 
 
@@ -176,6 +179,20 @@ def explain_video_error(error):
 
 class TwitchError(Exception):
     pass
+
+
+VIDEO_HISTORY = 15  # watch reports remembered for the banner (~5 min at one every 20 s)
+
+
+def is_connection_cut(error):
+    """True when a connection was reset / closed part-way (flaky VPN, Wi-Fi, antivirus) - worth one quick
+    retry. DNS failures, timeouts, refused connections and certificate errors are not."""
+    if isinstance(error, TwitchError):
+        error = error.__cause__
+    if isinstance(error, urllib.error.URLError):
+        error = error.reason
+    return (isinstance(error, (ConnectionError, http.client.HTTPException, ssl.SSLEOFError))
+            and not isinstance(error, ConnectionRefusedError))
 
 
 # --------------------------------------------------------------------------
@@ -230,8 +247,9 @@ class TwitchClient:
         self.spade_url = None
         self._last_spade = 0
         self._hls = None           # (login, media playlist url, fetched_at)
-        self.video_error = None    # last error reaching Twitch's video servers
+        self.video_error = None    # last error reaching Twitch's video servers (kept for the banner)
         self.video_failures = 0    # watch reports in a row that failed with a network error
+        self.video_history = deque(maxlen=VIDEO_HISTORY)  # recent watch reports: True = got through
 
     # -- HTTP helpers ------------------------------------------------------
     def _base_headers(self):
@@ -243,7 +261,9 @@ class TwitchClient:
             "Referer": CLIENT_URL,
         }
 
-    def _request(self, url, data=None, headers=None, form=False, raw=False):
+    def _request(self, url, data=None, headers=None, form=False, raw=False, retry=False):
+        """(status, body). retry=True: a connection cut part-way (flaky VPN / Wi-Fi / antivirus) is
+        retried once right away - only for requests that are safe to repeat."""
         body = None
         hdrs = self._base_headers()
         hdrs.update(headers or {})
@@ -255,6 +275,15 @@ class TwitchClient:
                 body = json.dumps(data).encode()
                 hdrs["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=body, headers=hdrs)
+        try:
+            return self._open(req, raw)
+        except TwitchError as e:
+            if not (retry and is_connection_cut(e)):
+                raise
+            return self._open(req, raw)
+
+    def _open(self, req, raw):
+        url = req.full_url
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 text = resp.read().decode("utf-8", "replace")
@@ -320,7 +349,7 @@ class TwitchClient:
         return False
 
     # -- GQL ---------------------------------------------------------------
-    def gql(self, op_name, variables):
+    def gql(self, op_name, variables, retry=True):
         payload = {
             "operationName": op_name,
             "variables": variables,
@@ -329,7 +358,7 @@ class TwitchClient:
         headers = {"Client-Session-Id": self.session_id}
         if self.token:
             headers["Authorization"] = f"OAuth {self.token}"
-        status, data = self._request(GQL_URL, payload, headers=headers)
+        status, data = self._request(GQL_URL, payload, headers=headers, retry=retry)
         if status == 401:
             raise TwitchError("Token expired or revoked. Please log in again.")
         if status != 200:
@@ -437,8 +466,8 @@ class TwitchClient:
         return game, channels
 
     def claim(self, drop_instance_id):
-        data = self.gql(
-            "DropsPage_ClaimDropRewards", {"input": {"dropInstanceID": drop_instance_id}}
+        data = self.gql(  # no automatic retry: a claim isn't repeated blindly
+            "DropsPage_ClaimDropRewards", {"input": {"dropInstanceID": drop_instance_id}}, retry=False
         )
         result = data.get("claimDropRewards") or {}
         return result.get("status", "OK")
@@ -459,8 +488,9 @@ class TwitchClient:
         return match.group(1)
 
     def send_watch(self, channel):
-        """Report watching `channel` (call every ~20 s). Returns True if Twitch's video servers
-        answered for every segment.
+        """Report watching `channel` (call every ~20 s). True if Twitch's video servers answered for
+        every segment, False if the stream / Twitch said no, None on a network problem (that's not the
+        channel's fault; it's counted in video_failures / video_history for the banner instead).
 
         Since early Oct 2026 Twitch only counts watch time when the stream's video is actually
         requested; the spade "minute-watched" event alone no longer counts. So, like
@@ -499,7 +529,7 @@ class TwitchClient:
             return None
         url = (f"https://usher.ttvnw.net/api/channel/hls/{channel['login']}.m3u8?"
                + urllib.parse.urlencode({"sig": tok["signature"], "token": tok["value"]}))
-        status, master = self._request(url, raw=True)
+        status, master = self._request(url, raw=True, retry=True)
         variants = [l.strip() for l in master.splitlines() if l.startswith("http")]
         if status != 200 or not variants:
             return None  # offline (usher answers 404) or not watchable
@@ -511,28 +541,31 @@ class TwitchClient:
             url = self._playlist_url(channel)
             if not url:
                 return False
-            status, media = self._request(url, raw=True)
+            status, media = self._request(url, raw=True, retry=True)
             segments = [l.strip() for l in media.splitlines() if l.startswith("http")]
             if status != 200 or not segments:
                 self._hls = None  # stream ended or token expired: get a fresh playlist next time
                 return False
             ok = self._head_all(segments)
-            self.video_error = None
-            self.video_failures = 0
-            return ok
         except TwitchError as e:
-            self._hls = None
             self.video_error = str(e)
             self.video_failures += 1
-            return False
+            self.video_history.append(False)
+            if self.video_failures >= 2:
+                self._hls = None  # keeps failing: fetch a fresh playlist (maybe from another server)
+            return None  # one-off: keep the playlist, so the next report is 1 request instead of 3
+        self.video_failures = 0
+        self.video_history.append(True)
+        return ok
 
     def _head_all(self, urls):
         """HEAD each URL, reusing one connection per server. True if all answered 200.
-        Video servers may close a reused connection at any time; a reused connection that fails is
-        retried once on a fresh one instead of being reported as "can't be reached"."""
+        Video servers may close a reused connection at any time, and flaky networks cut new ones: a
+        reused connection that fails, or a new one that's cut, is retried once on a fresh connection
+        instead of being reported as "can't be reached"."""
         conns = {}
 
-        def head(netloc, path):
+        def head(netloc, path, retried=False):
             conn = conns.get(netloc)
             reused = conn is not None
             if conn is None:
@@ -542,12 +575,12 @@ class TwitchClient:
                 resp = conn.getresponse()
                 resp.read()
                 return resp.status
-            except (OSError, http.client.HTTPException):
+            except (OSError, http.client.HTTPException) as e:
                 conn.close()
                 del conns[netloc]
-                if not reused:
+                if retried or not (reused or is_connection_cut(e)):
                     raise
-                return head(netloc, path)  # the server dropped the kept-alive connection: once more, fresh
+                return head(netloc, path, retried=True)  # once more, on a fresh connection
 
         try:
             for url in urls:

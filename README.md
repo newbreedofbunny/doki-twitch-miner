@@ -59,7 +59,7 @@ Make sure each game's account is linked on
 
 | Problem | Fix |
 |---|---|
-| A red banner says watch time isn't reaching Twitch | The banner names the cause and the fix (see [the table below](#connection-problems)). Click it to copy the details, e.g. to send to someone helping you. |
+| A red banner says watch time isn't reaching Twitch, or that drops are progressing slower | The banner names the cause and the fix (see [the table below](#connection-problems)). Click it to copy the details, e.g. to send to someone helping you. |
 | A drop is stuck at the same percentage | Twitch isn't counting that campaign at the moment. After 8 minutes without progress the miner skips it (one campaign for an hour, or the whole game for 2 hours if the game account isn't linked), then tries again. |
 | A campaign shows *Not progressing* | No progress for 8 minutes, usually because the game account isn't linked. Link it, then click **Refresh campaigns**. |
 | It's mining games I didn't pick | That's the **Also mine games I haven't picked** option (Settings → Mining). Untick it and the miner only mines your queue and picked games, and waits when they have nothing left. |
@@ -69,15 +69,19 @@ Make sure each game's account is linked on
 
 ### Connection problems
 
-Twitch only counts watch time when the stream's video is requested from its video servers (`*.ttvnw.net`).
-If that keeps failing for about a minute, the red banner shows one of these:
+Twitch only counts watch time when the stream's video is requested from its video servers (`*.ttvnw.net`),
+which the miner does every 20 seconds. A connection that's cut is retried once straight away. If requests
+still fail for about a minute, the red banner says *watch time isn't reaching Twitch*. If only some fail
+(a connection that drops now and then), it says *drops are progressing slower* and how many of the last 15
+failed. Drops still progress then, just slower. Either way, the banner names one of these causes:
 
 | The banner says | Fix |
 |---|---|
 | your DNS can't find Twitch's video servers | A DNS blocker (Pi-hole, AdGuard, NextDNS, router parental controls, a VPN's ad / tracker blocking) is blocking `*.ttvnw.net`. Allow-list it or turn the blocker off. |
 | something is intercepting secure connections | Turn off your antivirus's "HTTPS scanning" / "web shield" (Avast, AVG, Kaspersky, ESET, Bitdefender) or add an exception for `DokiTwitchMiner.exe`. School and work networks can do this too. |
 | a firewall or antivirus is blocking this app's internet access | Allow `DokiTwitchMiner.exe` in Windows Firewall and your antivirus. |
-| connections ... are timing out / being refused / keep getting cut | Usually a VPN, proxy, firewall or unstable network. Try without the VPN or on another network. |
+| the connection ... keeps getting cut | Usually a VPN, an antivirus "web shield" / HTTPS scanning, or unstable Wi-Fi. Try without the VPN, pause the web shield (or add an exception for `DokiTwitchMiner.exe`), restart the router or use Ethernet. |
+| connections ... are timing out / being refused | Usually a VPN, proxy or firewall. Try without the VPN or on another network. |
 
 A browser that still plays Twitch video doesn't rule out a DNS block: browsers often use their own "Secure DNS".
 Quick checks in PowerShell: `Resolve-DnsName usher.ttvnw.net` (fails = DNS block) and

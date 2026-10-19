@@ -51,7 +51,9 @@ def load_cache():
 
 WATCH_INTERVAL = 60          # one bookkeeping "tick" (progress check etc.) per minute
 WATCH_SEND_EVERY = 20        # ... with a watch report every 20 s (what Twitch now expects)
-VIDEO_FAIL_LIMIT = 3         # failed watch reports in a row (~1 min) before warning - ignores one-off blips
+VIDEO_FAIL_LIMIT = 3         # failed watch reports in a row (~1 min) -> "isn't reaching Twitch"
+VIDEO_FLAKY_SHOW = 3         # failures among the last 15 reports (~5 min) -> "drops are progressing slower" ...
+VIDEO_FLAKY_HIDE = 1         # ... which stays up until at most this many are left, so it doesn't flicker
 INVENTORY_EVERY = 3          # watch ticks between inventory syncs (claims + progress)
 PREEMPT_EVERY = 2            # watch ticks between "is something higher in the queue live?" checks
 STREAM_CHECK_EVERY = 5       # watch ticks between live / game checks of the watched channel
@@ -879,7 +881,8 @@ class Miner:
         self.stop_event = threading.Event()
         self.wake = threading.Event()
         self.channel = None
-        self.blocked = False
+        self.banner_state = None  # red banner: None, "blocked" (nothing gets through) or "flaky" (some does)
+        self.banner_info = None
         self.cooldown = {}  # campaign id -> time before which it isn't retried
         self._fallback_noted = None  # last unpicked campaign we explained in the log
 
@@ -1113,7 +1116,7 @@ class Miner:
                 self._report_blocking()
                 if ok:
                     fails = 0
-                else:
+                elif ok is False:  # None = network trouble: on the banner, but not this channel's fault
                     fails += 1
                     self.log(f"Watch report rejected ({fails}/3)")
                     if fails >= 3:
@@ -1141,7 +1144,7 @@ class Miner:
                 self._progress(camp, ch, drop, session_drop)
 
                 # Only blame the campaign when our own watch reports are getting through.
-                if not progress_seen and tick >= STALL_TICKS and fails == 0 and not self.blocked:
+                if not progress_seen and tick >= STALL_TICKS and fails == 0 and not self.banner_state:
                     if self.store.mark_stalled(camp) == "campaign":
                         self.log(f"No progress on '{camp.name}' after {STALL_TICKS} minutes - skipping this "
                                  "campaign for an hour (other campaigns keep mining).")
@@ -1195,17 +1198,36 @@ class Miner:
         return False
 
     def _report_blocking(self):
-        """Show / clear the red banner. Only after VIDEO_FAIL_LIMIT failed watch reports in a row, so a
-        one-off network blip doesn't raise a false alarm; the banner says what's wrong and how to fix it."""
-        blocked = self.client.video_failures >= VIDEO_FAIL_LIMIT
-        if blocked == self.blocked:
-            return
-        self.blocked = blocked
-        if blocked:
+        """Show / update / clear the red banner, which says what's wrong and how to fix it.
+        "blocked": VIDEO_FAIL_LIMIT failed watch reports in a row. "flaky": some of the recent reports
+        fail (a connection that drops now and then) - shown until the last ~5 minutes are (nearly) clean,
+        so it doesn't flicker on and off with every report. A one-off blip shows nothing."""
+        history = self.client.video_history
+        failed = history.count(False)
+        if self.client.video_failures >= VIDEO_FAIL_LIMIT:
+            state = "blocked"
+        elif failed >= VIDEO_FLAKY_SHOW or (self.banner_state and failed > VIDEO_FLAKY_HIDE):
+            state = "flaky"
+        else:
+            state = None
+        info = None
+        if state:
             error = self.client.video_error or "unknown error"
             cause, fix = explain_video_error(error)
-            self.emit("blocked", {"cause": cause, "fix": fix, "error": error})
-            self.log(f"WARNING: can't reach Twitch's video servers - {cause}. Fix: {fix} Error: {error}")
+            info = {"cause": cause, "fix": fix, "error": error,
+                    "partial": f"{failed} of the last {len(history)} watch reports failed" if state == "flaky"
+                    else None}
+        if info != self.banner_info:
+            self.banner_info = info
+            self.emit("blocked", info)
+        if state == self.banner_state:
+            return
+        self.banner_state = state
+        if state == "blocked":
+            self.log(f"WARNING: can't reach Twitch's video servers - {info['cause']}. Fix: {info['fix']} "
+                     f"Error: {info['error']}")
+        elif state == "flaky":
+            self.log(f"WARNING: drops are progressing slower - {info['partial']}, because {info['cause']}. "
+                     f"Fix: {info['fix']} Error: {info['error']}")
         else:
-            self.emit("blocked", None)
             self.log("Twitch's video servers are reachable again - watch time is being counted")

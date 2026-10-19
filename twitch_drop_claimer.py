@@ -997,7 +997,7 @@ class App(tk.Tk):
         self.sidebar.set_status(text)
 
     def _ui_blocked(self, info):
-        """Red banner: why watch time isn't reaching Twitch and what to do (info=None hides it)."""
+        """Red banner: why watch time isn't (fully) reaching Twitch and what to do (info=None hides it)."""
         if not info:
             self.blocked_banner.grid_remove()
             return
@@ -1005,11 +1005,12 @@ class App(tk.Tk):
             info = {"cause": "Twitch's video servers can't be reached", "fix": "", "error": ""}
         error = info.get("error", "")
         short = error if len(error) <= 140 else error[:137] + "..."
-        self.blocked_details = (f"Doki Twitch Miner v{APP_VERSION}\nWatch time isn't reaching Twitch: "
-                                f"{info['cause']}.\nFix: {info['fix']}\nError: {error}")
-        self.blocked_banner.configure(
-            text=f"Watch time isn't reaching Twitch: {info['cause']}.\n{info['fix']}\n"
-                 f"Error: {short}   (click to copy these details)")
+        if info.get("partial"):  # some reports get through: slower, not stopped
+            head = f"Drops are progressing slower: {info['partial']}, because {info['cause']}."
+        else:
+            head = f"Watch time isn't reaching Twitch: {info['cause']}."
+        self.blocked_details = f"Doki Twitch Miner v{APP_VERSION}\n{head}\nFix: {info['fix']}\nError: {error}"
+        self.blocked_banner.configure(text=f"{head}\n{info['fix']}\nError: {short}   (click to copy these details)")
         self.blocked_banner.grid()
 
     def _copy_banner(self, _event=None):
