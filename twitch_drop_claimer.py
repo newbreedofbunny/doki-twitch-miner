@@ -506,13 +506,12 @@ class App(tk.Tk):
                             "account's drops yourself. Click an account to see its progress and campaigns below.",
                   style="Muted.TLabel", wraplength=560, justify="left").pack(anchor="w", pady=(2, 0))
 
-        self.blocked_banner = tk.Label(
-            pg, anchor="w", justify="left", padx=12, pady=8, wraplength=1000,
-            text="Watch time isn't reaching Twitch: the stream's video servers can't be reached. Drops only "
-                 "progress when the video is requested - check your connection, VPN or ad-block DNS. "
-                 "This clears by itself once they're reachable again.")
+        self.blocked_banner = tk.Label(pg, anchor="w", justify="left", padx=12, pady=8, wraplength=1000,
+                                       cursor="hand2")
         self.blocked_banner.grid(row=1, column=0, columnspan=3, sticky="ew", padx=PAD, pady=(0, 8))
         self.blocked_banner.grid_remove()
+        self.blocked_banner.bind("<Button-1>", self._copy_banner)
+        self.blocked_details = ""
         self.tk_widgets.append((self.blocked_banner, "banner"))
 
         outer, prog = self.panel(pg, "Progress")
@@ -997,11 +996,27 @@ class App(tk.Tk):
         """App-wide status (e.g. the shared campaign scan)."""
         self.sidebar.set_status(text)
 
-    def _ui_blocked(self, blocked):
-        if blocked:
-            self.blocked_banner.grid()
-        else:
+    def _ui_blocked(self, info):
+        """Red banner: why watch time isn't reaching Twitch and what to do (info=None hides it)."""
+        if not info:
             self.blocked_banner.grid_remove()
+            return
+        if not isinstance(info, dict):
+            info = {"cause": "Twitch's video servers can't be reached", "fix": "", "error": ""}
+        error = info.get("error", "")
+        short = error if len(error) <= 140 else error[:137] + "..."
+        self.blocked_details = (f"Doki Twitch Miner v{APP_VERSION}\nWatch time isn't reaching Twitch: "
+                                f"{info['cause']}.\nFix: {info['fix']}\nError: {error}")
+        self.blocked_banner.configure(
+            text=f"Watch time isn't reaching Twitch: {info['cause']}.\n{info['fix']}\n"
+                 f"Error: {short}   (click to copy these details)")
+        self.blocked_banner.grid()
+
+    def _copy_banner(self, _event=None):
+        if self.blocked_details:
+            self.clipboard_clear()
+            self.clipboard_append(self.blocked_details)
+            self.log("Copied the connection problem details to the clipboard")
 
     def _ui_progress(self, info):
         if not info:
@@ -1224,7 +1239,7 @@ class App(tk.Tk):
         """Repaint everything account-specific from the viewed session's latest data."""
         s = self.view
         self._ui_campaigns_clear()
-        self._ui_blocked(False)
+        self._ui_blocked(None)
         self._ui_progress(None)
         self._ui_channels([], None)
         login = (s.login if s else "") or ""
@@ -1251,7 +1266,7 @@ class App(tk.Tk):
         for kind in ("progress", "channels", "blocked"):
             s.last.pop(kind, None)
         if s is self.view:
-            self._ui_blocked(False)
+            self._ui_blocked(None)
             self._ui_progress(None)
             self._ui_channels([], None)
             self.mining_status_var.set("Idle")

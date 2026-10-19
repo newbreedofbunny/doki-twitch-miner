@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 # Settings. Twitch changes the GQL hashes from time to time; if requests start
 # failing with "PersistedQueryNotFound", update them in settings.json.
 # --------------------------------------------------------------------------
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 
 DEFAULTS = {
     "client_id": "ue6666qo983tsx6so1t0vnawi233wa",  # Twitch Android TV app (supports device login)
@@ -137,6 +137,43 @@ def game_slug(settings, name):
     return (settings.get("game_slugs") or {}).get(name) or slugify(name)
 
 
+# (patterns in the error text, short cause, what to do) - shown on the red banner and in the log
+VIDEO_ERROR_HELP = [
+    (("getaddrinfo", "11001", "11002", "11004", "name or service not known", "nodename nor servname"),
+     "your DNS can't find Twitch's video servers",
+     "A DNS blocker is the usual cause: Pi-hole, AdGuard, NextDNS, router parental controls, or a VPN's "
+     "ad / tracker blocking (Mullvad, Proton NetShield, Nord Threat Protection). Allow-list *.ttvnw.net or "
+     "turn the blocker off."),
+    (("certificate_verify_failed", "certificate verify failed", "sslcertverificationerror", "self-signed",
+      "unable to get local issuer"),
+     "something is intercepting secure connections",
+     "Usually an antivirus 'HTTPS scanning' / 'web shield' (Avast, AVG, Kaspersky, ESET, Bitdefender) or a "
+     "school / work network. Turn HTTPS scanning off or add an exception for DokiTwitchMiner.exe."),
+    (("10013", "forbidden by its access permissions", "permissionerror"),
+     "a firewall or antivirus is blocking this app's internet access",
+     "Allow DokiTwitchMiner.exe in Windows Firewall and in your antivirus."),
+    (("timed out", "10060", "timeouterror"),
+     "connections to Twitch's video servers are timing out",
+     "A VPN, firewall or your network may be dropping them - try without the VPN and check the firewall."),
+    (("10061", "connection refused", "connectionrefusederror"),
+     "connections to Twitch's video servers are being refused",
+     "A proxy, firewall or VPN is in the way - try without them."),
+    (("10054", "10053", "connectionreset", "connectionaborted", "remotedisconnected"),
+     "the connection to Twitch's video servers keeps getting cut",
+     "Usually a VPN or an unstable connection - try without the VPN or on another network."),
+]
+
+
+def explain_video_error(error):
+    """(cause, fix) for a video-server error text, in plain words."""
+    text = (error or "").lower()
+    for patterns, cause, fix in VIDEO_ERROR_HELP:
+        if any(p in text for p in patterns):
+            return cause, fix
+    return ("Twitch's video servers can't be reached",
+            "Check your internet connection, VPN, firewall / antivirus and any ad-block DNS.")
+
+
 class TwitchError(Exception):
     pass
 
@@ -193,7 +230,8 @@ class TwitchClient:
         self.spade_url = None
         self._last_spade = 0
         self._hls = None           # (login, media playlist url, fetched_at)
-        self.video_error = None    # set while Twitch's video servers can't be reached
+        self.video_error = None    # last error reaching Twitch's video servers
+        self.video_failures = 0    # watch reports in a row that failed with a network error
 
     # -- HTTP helpers ------------------------------------------------------
     def _base_headers(self):
@@ -480,26 +518,41 @@ class TwitchClient:
                 return False
             ok = self._head_all(segments)
             self.video_error = None
+            self.video_failures = 0
             return ok
         except TwitchError as e:
             self._hls = None
             self.video_error = str(e)
+            self.video_failures += 1
             return False
 
     def _head_all(self, urls):
-        """HEAD each URL, reusing one connection per server. True if all answered 200."""
+        """HEAD each URL, reusing one connection per server. True if all answered 200.
+        Video servers may close a reused connection at any time; a reused connection that fails is
+        retried once on a fresh one instead of being reported as "can't be reached"."""
         conns = {}
+
+        def head(netloc, path):
+            conn = conns.get(netloc)
+            reused = conn is not None
+            if conn is None:
+                conn = conns[netloc] = http.client.HTTPSConnection(netloc, timeout=20)
+            try:
+                conn.request("HEAD", path, headers={"User-Agent": WEB_USER_AGENT})
+                resp = conn.getresponse()
+                resp.read()
+                return resp.status
+            except (OSError, http.client.HTTPException):
+                conn.close()
+                del conns[netloc]
+                if not reused:
+                    raise
+                return head(netloc, path)  # the server dropped the kept-alive connection: once more, fresh
+
         try:
             for url in urls:
                 parts = urllib.parse.urlsplit(url)
-                conn = conns.get(parts.netloc)
-                if conn is None:
-                    conn = conns[parts.netloc] = http.client.HTTPSConnection(parts.netloc, timeout=20)
-                conn.request("HEAD", parts.path + (f"?{parts.query}" if parts.query else ""),
-                             headers={"User-Agent": WEB_USER_AGENT})
-                resp = conn.getresponse()
-                resp.read()
-                if resp.status != 200:
+                if head(parts.netloc, parts.path + (f"?{parts.query}" if parts.query else "")) != 200:
                     return False
             return True
         except (OSError, http.client.HTTPException) as e:

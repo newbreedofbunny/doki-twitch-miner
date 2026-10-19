@@ -23,8 +23,8 @@ from datetime import datetime, timezone
 from html import unescape
 
 from twitch_api import (
-    APP_DIR, DROPS_PAGE_URL, SETTINGS_FILE, WEB_USER_AGENT, TwitchError, game_slug, load_json,
-    parse_ts, save_json, slugify, utcnow,
+    APP_DIR, DROPS_PAGE_URL, SETTINGS_FILE, WEB_USER_AGENT, TwitchError, explain_video_error, game_slug,
+    load_json, parse_ts, save_json, slugify, utcnow,
 )
 
 CACHE_FILE = os.path.join(APP_DIR, "campaign_cache.json")
@@ -51,6 +51,7 @@ def load_cache():
 
 WATCH_INTERVAL = 60          # one bookkeeping "tick" (progress check etc.) per minute
 WATCH_SEND_EVERY = 20        # ... with a watch report every 20 s (what Twitch now expects)
+VIDEO_FAIL_LIMIT = 3         # failed watch reports in a row (~1 min) before warning - ignores one-off blips
 INVENTORY_EVERY = 3          # watch ticks between inventory syncs (claims + progress)
 PREEMPT_EVERY = 2            # watch ticks between "is something higher in the queue live?" checks
 STREAM_CHECK_EVERY = 5       # watch ticks between live / game checks of the watched channel
@@ -879,7 +880,6 @@ class Miner:
         self.wake = threading.Event()
         self.channel = None
         self.blocked = False
-        self.blocked_warned = False
         self.cooldown = {}  # campaign id -> time before which it isn't retried
         self._fallback_noted = None  # last unpicked campaign we explained in the log
 
@@ -1141,7 +1141,7 @@ class Miner:
                 self._progress(camp, ch, drop, session_drop)
 
                 # Only blame the campaign when our own watch reports are getting through.
-                if not progress_seen and tick >= STALL_TICKS and fails == 0 and not self.client.video_error:
+                if not progress_seen and tick >= STALL_TICKS and fails == 0 and not self.blocked:
                     if self.store.mark_stalled(camp) == "campaign":
                         self.log(f"No progress on '{camp.name}' after {STALL_TICKS} minutes - skipping this "
                                  "campaign for an hour (other campaigns keep mining).")
@@ -1188,21 +1188,24 @@ class Miner:
                     self.client.send_watch(ch)
                 except TwitchError:
                     pass
+                self._report_blocking()
             if self.wake.is_set() or self.wake.wait(WATCH_SEND_EVERY):  # refresh / queue changed: re-pick now
                 self.wake.clear()
                 return not self.stop_event.is_set()
         return False
 
     def _report_blocking(self):
-        blocked = bool(self.client.video_error)
-        if blocked != self.blocked:
-            self.blocked = blocked
-            self.emit("blocked", blocked)
-        if not blocked and self.blocked_warned:
-            self.blocked_warned = False
+        """Show / clear the red banner. Only after VIDEO_FAIL_LIMIT failed watch reports in a row, so a
+        one-off network blip doesn't raise a false alarm; the banner says what's wrong and how to fix it."""
+        blocked = self.client.video_failures >= VIDEO_FAIL_LIMIT
+        if blocked == self.blocked:
+            return
+        self.blocked = blocked
+        if blocked:
+            error = self.client.video_error or "unknown error"
+            cause, fix = explain_video_error(error)
+            self.emit("blocked", {"cause": cause, "fix": fix, "error": error})
+            self.log(f"WARNING: can't reach Twitch's video servers - {cause}. Fix: {fix} Error: {error}")
+        else:
+            self.emit("blocked", None)
             self.log("Twitch's video servers are reachable again - watch time is being counted")
-        elif blocked and not self.blocked_warned:
-            self.blocked_warned = True
-            self.log(f"WARNING: can't reach Twitch's video servers ({self.client.video_error}). Watch time only "
-                     "counts when the stream's video is requested, so drops won't progress until this works "
-                     "(check your connection, VPN or ad-block DNS).")
