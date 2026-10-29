@@ -240,6 +240,13 @@ class Campaign:
         return any(d.watchable for d in self.drops)
 
     @property
+    def runs_everywhere(self):
+        """Twitch says this campaign has no channel list, so it counts on every drops-enabled stream of its
+        game - even channels Twitch doesn't list it on (e.g. a Twitch Rivals campaign that only shows up on
+        the event's own channels, while every Rust stream with drops on progresses it)."""
+        return self.general is True and self.kind_rank >= 2
+
+    @property
     def remaining(self):
         return [d for d in self.drops if d.minable]
 
@@ -307,6 +314,7 @@ class Discovery:
         self.version = 0             # bumps on every scan; stores re-adopt when it changes
         self.live = {}               # login (lower) -> True/False from the latest checks
         self.cache = load_cache()    # campaign id -> what we learned about it
+        self.game_channels = {}      # game slug -> its live drops-enabled channels, as of the latest scan
         self._page_warned = set()
 
     def selected_slugs(self):
@@ -318,6 +326,10 @@ class Discovery:
 
     def is_live(self, login):
         return self.live.get(login.lower(), False)
+
+    def game_logins(self, slug):
+        """Live drops-enabled channels of a game (latest scan) - where campaigns that run_everywhere count."""
+        return [ch["login"] for ch in self.game_channels.get(slug) or []]
 
     def note_live(self, login, live):
         self.live[login.lower()] = live
@@ -367,7 +379,7 @@ class Discovery:
                         found[camp.id] = camp
         self.live = live
         with self.lock:
-            self._apply_cache(found)
+            self._apply_cache(found, deep)
         self._apply_streamer_pages(found, deep, client)
         self._refresh_live(found, deep, client)
 
@@ -417,6 +429,8 @@ class Discovery:
     def scan_game(self, client, slug, channels_to_check):
         """Campaigns running on a game's live drops-enabled channels."""
         game, channels = client.get_game_streams(slug, limit=max(10, channels_to_check))
+        if game:
+            self.game_channels[slug] = channels
         if not game or not channels:
             return []
         game_id = str(game.get("id"))
@@ -475,7 +489,7 @@ class Discovery:
         self.cache[camp.id] = {"raw": raw, "slug": camp.slug, "game_name": camp.game_name,
                                "logins": logins, "general": general, "rank": rank}
 
-    def _apply_cache(self, found):
+    def _apply_cache(self, found, deep=()):
         now = utcnow()
         for cid in list(self.cache):
             entry = self.cache[cid]
@@ -485,8 +499,12 @@ class Discovery:
                 continue
             camp = found.get(cid)
             if camp is None:
-                if entry.get("general") is not False:
-                    continue  # only streamer campaigns are worth showing while offline
+                # Streamer campaigns are worth showing while their channels are offline. So are campaigns
+                # of picked / queued games that run everywhere: Twitch doesn't always list them on the
+                # channels a scan checks, but every drops-enabled stream of the game progresses them.
+                confirmed_general = entry.get("general") is True and entry.get("rank", 0) >= 2
+                if entry.get("general") is not False and not (confirmed_general and entry.get("slug") in deep):
+                    continue
                 camp = found[cid] = Campaign(entry["raw"], slug=entry.get("slug"),
                                              game_name=entry.get("game_name"))
             camp.set_kind(entry.get("general"), entry.get("rank", 0))
@@ -754,7 +772,8 @@ class CampaignStore:
                     self.campaigns[inv_camp.id].merge(inv_camp)
                     self.discovery.remember(self.campaigns[inv_camp.id])
                 elif inv_camp.watchable:
-                    self.campaigns[inv_camp.id] = inv_camp  # in progress but no live channel now
+                    self.campaigns[inv_camp.id] = inv_camp  # in progress but not seen on a channel now
+                    self.discovery.remember(inv_camp)  # so other accounts and later scans know it too
             apply_inventory(self.campaigns.values(), inventory)
         self.publish()
 
@@ -791,7 +810,7 @@ class CampaignStore:
     def has_live_channel(self, c):
         if c.general is False or c.placeholder:
             return any(self.is_live(l) for l in c.streamer_logins)
-        return bool(c.channels)
+        return bool(c.channels) or (c.runs_everywhere and bool(self.discovery.game_logins(c.slug)))
 
     def state_of(self, c, selected, queued_camps):
         if c.id == self.target_id:
@@ -937,7 +956,11 @@ class Miner:
     def _logins_for(self, camp):
         if camp.general is False or camp.placeholder:
             return camp.streamer_logins
-        return [c["login"] for c in camp.channels]
+        logins = [c["login"] for c in camp.channels]
+        if camp.runs_everywhere:  # then the game's other drops-enabled streams count too
+            seen = {l.lower() for l in logins}
+            logins += [l for l in self.store.discovery.game_logins(camp.slug) if l.lower() not in seen]
+        return logins
 
     def _live_channel(self, camp, budget=MAX_LOGIN_CHECKS):
         current = (self.channel or {}).get("login", "").lower()

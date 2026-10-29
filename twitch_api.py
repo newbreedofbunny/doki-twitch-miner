@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 # Settings. Twitch changes the GQL hashes from time to time; if requests start
 # failing with "PersistedQueryNotFound", update them in settings.json.
 # --------------------------------------------------------------------------
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 
 DEFAULTS = {
     "client_id": "ue6666qo983tsx6so1t0vnawi233wa",  # Twitch Android TV app (supports device login)
@@ -64,6 +64,7 @@ GQL_URL = "https://gql.twitch.tv/gql"
 DEVICE_URL = "https://id.twitch.tv/oauth2/device"
 TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 VALIDATE_URL = "https://id.twitch.tv/oauth2/validate"
+REVOKE_URL = "https://id.twitch.tv/oauth2/revoke"
 DROPS_PAGE_URL = "https://www.twitch.tv/drops/campaigns"
 SPADE_PATTERN = r'"spade_?url": ?"(https://[.\w\-/]+)"'
 SETTINGS_JS_PATTERN = r'src="(https://[\w.]+/config/settings\.[0-9a-f]{32}\.js)"'
@@ -314,6 +315,14 @@ class TwitchClient:
             self.user_id = data.get("user_id")
             return True
         return False
+
+    def revoke(self):
+        """Sign this app's login out on Twitch's side (used by Uninstall). True when Twitch confirmed it, or
+        the login was no longer valid anyway. Raises TwitchError when Twitch can't be reached."""
+        if not self.token:
+            return True
+        status, _ = self._request(REVOKE_URL, {"client_id": self.s["client_id"], "token": self.token}, form=True)
+        return status in (200, 400)  # 400 = invalid token: already signed out
 
     def start_device_login(self):
         status, data = self._request(

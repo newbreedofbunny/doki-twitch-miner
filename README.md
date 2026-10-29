@@ -63,6 +63,7 @@ Make sure each game's account is linked on
 | A drop is stuck at the same percentage | Twitch isn't counting that campaign at the moment. After 8 minutes without progress the miner skips it (one campaign for an hour, or the whole game for 2 hours if the game account isn't linked), then tries again. |
 | A campaign shows *Not progressing* | No progress for 8 minutes, usually because the game account isn't linked. Link it, then click **Refresh campaigns**. |
 | It's mining games I didn't pick | That's the **Also mine games I haven't picked** option (Settings → Mining). Untick it and the miner only mines your queue and picked games, and waits when they have nothing left. |
+| It says *Nothing to mine right now*, but a campaign for your game is running | Some general campaigns (e.g. Twitch Rivals events) are only listed on a few channels, though every drops-enabled stream of the game counts. Since v1.0.8 the miner watches any of those streams for them. Otherwise check that the game is picked or one of its drops is queued, then click **Refresh campaigns**. |
 | A streamer drop shows *Not started* | The streamer is live, but Twitch hasn't switched their drop on yet. It's retried on every rescan. |
 | Where are my settings? | `%APPDATA%\TwitchDropClaimer\` (settings, saved logins, downloaded fonts). |
 | Something went wrong and I want to report it | Attach `%APPDATA%\TwitchDropClaimer\miner.log`. It records what the console showed, plus a health line every 5 minutes (memory, handles, cache size). It stays around 1 MB and contains no passwords or login tokens. |
@@ -86,6 +87,21 @@ failed. Drops still progress then, just slower. Either way, the banner names one
 A browser that still plays Twitch video doesn't rule out a DNS block: browsers often use their own "Secure DNS".
 Quick checks in PowerShell: `Resolve-DnsName usher.ttvnw.net` (fails = DNS block) and
 `Test-NetConnection usher.ttvnw.net -Port 443` (`TcpTestSucceeded : False` = firewall / VPN block).
+
+## Uninstall
+
+Open **Settings** and click **Uninstall...** (top right). The miner then:
+
+- signs itself out of your Twitch accounts, on Twitch's side too,
+- removes itself from Windows startup and deletes its shortcuts,
+- deletes its settings, saved logins, campaign list, log and fonts (`%APPDATA%\TwitchDropClaimer`),
+- deletes `DokiTwitchMiner.exe` itself, a few seconds after it closes.
+
+Your Twitch accounts, claimed drops and game items aren't affected. If you run it from source, your source
+folder is left alone; delete it yourself.
+
+To uninstall by hand instead: quit the miner, delete `DokiTwitchMiner.exe` and the `%APPDATA%\TwitchDropClaimer`
+folder, and disconnect the miner under twitch.tv → **Settings → Connections**.
 
 ## Run from source
 

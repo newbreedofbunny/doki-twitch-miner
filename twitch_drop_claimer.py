@@ -13,8 +13,10 @@ Run:  pythonw twitch_drop_claimer.py   (or double-click Start.bat)
 Only the Python standard library is used.
 """
 
+import base64
 import os
 import queue
+import subprocess
 import sys
 import threading
 import traceback
@@ -90,6 +92,47 @@ def set_run_on_startup(enabled):
                 winreg.DeleteValue(key, RUN_VALUE)
             except FileNotFoundError:
                 pass
+
+
+SHORTCUT_NAME = "Twitch Drop Miner.lnk"   # made by "Create Shortcut.ps1" (Desktop + Start menu)
+
+
+def program_file():
+    """The running .exe, or None when running from source (Uninstall never deletes a source folder)."""
+    if not getattr(sys, "frozen", False):
+        return None
+    exe = os.path.abspath(sys.executable)
+    name = os.path.basename(exe).lower()
+    return exe if name.endswith(".exe") and not name.startswith("python") else None
+
+
+def schedule_removal(paths, wait_pids):
+    """Delete `paths` (files / folders) and the app's shortcuts once `wait_pids` have exited. A running
+    program can't delete its own .exe or files it still has open, so a hidden PowerShell does it a moment
+    after the app has closed."""
+    quoted = ", ".join("'" + p.replace("'", "''") + "'" for p in paths)
+    script = "\n".join([
+        "$ErrorActionPreference = 'SilentlyContinue'",
+        f"foreach ($id in @({', '.join(str(int(p)) for p in wait_pids)})) {{ Wait-Process -Id $id -Timeout 60 }}",
+        f"$paths = @({quoted})",
+        "foreach ($dir in 'Desktop', 'Programs') { "
+        f"$paths += Join-Path ([Environment]::GetFolderPath($dir)) '{SHORTCUT_NAME}' }}",
+        "for ($i = 0; $i -lt 60; $i++) {",
+        "    foreach ($p in $paths) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force } }",
+        "    if (-not ($paths | Where-Object { Test-Path -LiteralPath $_ })) { break }",
+        "    Start-Sleep -Milliseconds 500",
+        "}",
+    ])
+    shell = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0",
+                         "powershell.exe")
+    args = [shell if os.path.exists(shell) else "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+            "Bypass", "-WindowStyle", "Hidden", "-EncodedCommand",
+            base64.b64encode(script.encode("utf-16-le")).decode()]
+    flags = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+    try:  # + CREATE_BREAKAWAY_FROM_JOB, so closing the app can't take the clean-up with it
+        return subprocess.Popen(args, creationflags=flags | 0x01000000, close_fds=True)
+    except OSError:
+        return subprocess.Popen(args, creationflags=flags, close_fds=True)
 
 
 def set_app_id():
@@ -727,6 +770,15 @@ class App(tk.Tk):
         link.bind("<Button-1>", lambda e: webbrowser.open(DROPS_PAGE_URL))
         ttk.Label(help_, text=f"Settings file: {SETTINGS_FILE}", style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
         ttk.Label(help_, text=f"Doki Twitch Miner v{APP_VERSION}", style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
+
+        # Top of the right-hand column, above Monika (the left column is full at the minimum window size).
+        outer, rm = self.panel(pg, "Uninstall")
+        outer.grid(row=0, column=1, rowspan=2, sticky="new", padx=(10, PAD), pady=(PAD, 10))
+        ttk.Label(rm, text="Signs the miner out of your Twitch accounts, takes it off Windows startup and deletes "
+                           "its settings, saved logins, shortcuts and the program itself.",
+                  style="Muted.TLabel", wraplength=MASCOT_W - 40, justify="left").pack(anchor="w")
+        self.uninstall_btn = ttk.Button(rm, text="Uninstall...", command=self.on_uninstall)
+        self.uninstall_btn.pack(anchor="w", pady=(8, 0))
         return pg
 
     # -- Pages ------------------------------------------------------------------
@@ -1860,6 +1912,72 @@ class App(tk.Tk):
         except OSError as e:
             self.startup_var.set(not want)
             messagebox.showerror("Startup setting", f"Could not change the startup setting:\n{e}")
+
+    def on_uninstall(self):
+        """Settings > Uninstall: stop, sign out on Twitch, remove startup entry / shortcuts / data / program."""
+        exe = program_file()
+        logins = self.accounts.logins()
+        what = [
+            "\u2022 stops mining and signs the miner out of "
+            + (f"your {len(logins)} Twitch account(s), on Twitch too" if logins else "Twitch"),
+            "\u2022 removes it from Windows startup and deletes its shortcuts",
+            f"\u2022 deletes its settings, saved logins, campaign list, log and fonts:\n   {APP_DIR}",
+        ]
+        if exe:
+            what.append(f"\u2022 deletes the program itself:\n   {exe}")
+        if not messagebox.askyesno(
+                "Uninstall Doki Twitch Miner",
+                "This removes Doki Twitch Miner from this PC:\n\n" + "\n".join(what)
+                + "\n\nYour Twitch accounts, claimed drops and game items are not affected.\n"
+                  "This can't be undone. Uninstall now?", icon="warning", default="no"):
+            return
+        self.uninstall_btn.state(["disabled"])
+        self.mining = False
+        for s in self.sessions:
+            self._stop_session(s)
+        self.sidebar.set_status("Uninstalling...")
+        self.log("Uninstalling...")
+        accounts = [self.accounts.get(login) for login in logins]
+
+        def sign_out():
+            failed = []
+            for account in accounts:
+                try:
+                    if not TwitchClient(self.settings, self.accounts.device_id, account).revoke():
+                        failed.append(account.get("login"))
+                except TwitchError:
+                    failed.append(account.get("login"))
+            self.emit("uninstall_done", exe, failed)
+        self._bg(sign_out)
+
+    def _ui_uninstall_done(self, exe, failed):
+        notes = []
+        try:
+            set_run_on_startup(False)
+        except OSError as e:
+            notes.append(f"Couldn't remove it from Windows startup ({e}).")
+        data = os.path.abspath(APP_DIR)
+        paths = [data] if os.path.basename(data) == "TwitchDropClaimer" else []  # only ever this app's folder
+        if exe:
+            paths.append(exe)
+        try:
+            # A one-file .exe runs as two processes; both must be gone before its file can be deleted.
+            schedule_removal(paths, [os.getpid()] + ([os.getppid()] if exe else []))
+        except OSError as e:
+            notes.append(f"Couldn't start the clean-up ({e}). After it closes, delete these yourself:\n"
+                         + "\n".join(paths))
+        if failed:
+            notes.append(f"Couldn't sign the miner out of {', '.join(failed)} on Twitch (no connection?). To "
+                         "finish, open twitch.tv > Settings > Connections and disconnect it there.")
+        if not exe:
+            notes.append("This copy runs from source code, so its folder was left alone - delete it yourself "
+                         f"if you want:\n{os.path.dirname(os.path.abspath(__file__))}")
+        notes.append("If you pinned it to the taskbar, unpin it.")
+        self._file_log("Uninstalled")
+        messagebox.showinfo("Doki Twitch Miner uninstalled",
+                            "Doki Twitch Miner has been uninstalled. It closes now, and its files are removed a "
+                            "few seconds later.\n\n" + "\n\n".join(notes))
+        self.on_close()
 
     def on_toggle_unselected(self):
         """Turning on "mine games I haven't picked" needs a yes - it's easy to tick by accident."""
